@@ -1,23 +1,22 @@
 ###############################################################################
 # infra.yml — Terraform plan + apply for the calculator-app AWS infrastructure
 #
-# Triggers: push to main when any file under infra/ changes, or manual dispatch.
-#
 # Authentication: static AWS IAM credentials (AWS_ACCESS_KEY_ID /
-# AWS_SECRET_ACCESS_KEY) stored as repository secrets.  These are the
-# bootstrap credentials required to CREATE the GitHub OIDC role; once the
-# role exists the application deploy workflow (deploy.yml) uses OIDC instead.
+# AWS_SECRET_ACCESS_KEY) stored as repository secrets via set_pipeline_account.
+#
+# State backend: S3 bucket passed via TF_STATE_BUCKET (secret) and
+# TF_STATE_KEY / AWS_REGION (variables) written by set_pipeline_account.
 #
 # After a successful apply the workflow writes four GitHub repository variables
 # and one repository secret that the deploy workflow consumes:
 #
-#   Variables  (readable by all workflows, shown in UI):
-#     AWS_ROLE_ARN               — IAM role ARN for OIDC assume
+#   Variables:
 #     TF_OUT_ECR_REPOSITORY_URL  — ECR repository URL
 #     TF_OUT_EC2_PUBLIC_IP       — EC2 instance public IP
 #     TF_OUT_ALB_DNS_NAME        — ALB DNS name
+#     AWS_ROLE_ARN               — IAM role ARN for OIDC (future use)
 #
-#   Secret  (write-only, never logged):
+#   Secret:
 #     EC2_SSH_KEY                — PEM private key for SSH access
 ###############################################################################
 
@@ -45,6 +44,12 @@ on:
           - plan
           - apply
           - destroy
+      revision:
+        description: "Git ref to check out"
+        required: false
+      udap_run_id:
+        description: "UDAP run id"
+        required: false
 
 permissions:
   contents: read
@@ -53,7 +58,6 @@ permissions:
 env:
   TF_VERSION:  "1.7.5"
   WORKING_DIR: "./infra"
-  AWS_REGION:  "us-east-1"
 
 jobs:
   terraform:
@@ -74,23 +78,23 @@ jobs:
       # -----------------------------------------------------------------------
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.revision || github.sha }}
 
       # -----------------------------------------------------------------------
-      # Static IAM credentials — required for the bootstrap apply that creates
-      # the OIDC provider and role.  Subsequent workflows use the OIDC role.
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region:            ${{ env.AWS_REGION }}
+          aws-region:            ${{ vars.AWS_REGION }}
 
       # -----------------------------------------------------------------------
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
-          terraform_wrapper: false   # disable wrapper so raw output is captured
+          terraform_wrapper: false
 
       # -----------------------------------------------------------------------
       - name: Terraform Format Check
@@ -105,11 +109,14 @@ jobs:
           terraform init \
             -input=false \
             -reconfigure \
-            -backend-config="bucket=udap-calculator-tf-state-a7f3k9" \
-            -backend-config="key=calculator-app/terraform.tfstate" \
-            -backend-config="region=us-east-1" \
-            -backend-config="encrypt=true" \
-            -backend-config="dynamodb_table=udap-calculator-tf-lock"
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ vars.TF_STATE_KEY }}" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="encrypt=true"
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION:            ${{ vars.AWS_REGION }}
 
       # -----------------------------------------------------------------------
       - name: Terraform Validate
@@ -126,7 +133,7 @@ jobs:
             -out=tfplan \
             2>&1 | tee plan_output.txt
         env:
-          TF_VAR_aws_region: ${{ env.AWS_REGION }}
+          TF_VAR_aws_region: ${{ vars.AWS_REGION }}
 
       # -----------------------------------------------------------------------
       - name: Comment plan on PR
@@ -162,7 +169,7 @@ jobs:
             -auto-approve \
             tfplan
         env:
-          TF_VAR_aws_region: ${{ env.AWS_REGION }}
+          TF_VAR_aws_region: ${{ vars.AWS_REGION }}
 
       # -----------------------------------------------------------------------
       - name: Terraform Destroy
@@ -174,7 +181,7 @@ jobs:
             -input=false \
             -auto-approve
         env:
-          TF_VAR_aws_region: ${{ env.AWS_REGION }}
+          TF_VAR_aws_region: ${{ vars.AWS_REGION }}
 
       # -----------------------------------------------------------------------
       - name: Capture Terraform outputs
@@ -201,24 +208,21 @@ jobs:
           | aws_role_arn | \`$ROLE_ARN\` |
           EOF
 
+          # Emit the live URL for UDAP placement tracking
+          echo "Live URL: http://$EC2_IP"
+
       # -----------------------------------------------------------------------
-      # Retrieve the sensitive private key (requires a second terraform output
-      # call with -json so the wrapper doesn't strip the value).
       - name: Retrieve private key
         id: privkey
         if: steps.apply.outcome == 'success'
         run: |
           PRIVKEY=$(terraform output -raw ec2_private_key_pem 2>/dev/null || echo "")
-          # Mask the key so it is never echoed in plain text
           echo "::add-mask::$PRIVKEY"
           echo "pem<<KEYEOF" >> "$GITHUB_OUTPUT"
           echo "$PRIVKEY"   >> "$GITHUB_OUTPUT"
           echo "KEYEOF"     >> "$GITHUB_OUTPUT"
 
       # -----------------------------------------------------------------------
-      # Set repository variables and the EC2_SSH_KEY secret via REST API.
-      # GITHUB_TOKEN is a fine-grained token scoped to this repository; it has
-      # Actions:write and Secrets:write on the repo.
       - name: Set repository variables and EC2_SSH_KEY secret
         if: steps.apply.outcome == 'success'
         env:
@@ -233,9 +237,6 @@ jobs:
           API="https://api.github.com"
           AUTH=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
 
-          ###########################################################################
-          # Helper: upsert a repository variable (PATCH existing, POST new)
-          ###########################################################################
           set_var() {
             local name="$1"
             local value="$2"
@@ -253,10 +254,6 @@ jobs:
             fi
           }
 
-          ###########################################################################
-          # Helper: upsert a repository secret (requires libsodium / gh CLI)
-          # gh secret set handles the encryption automatically.
-          ###########################################################################
           set_secret() {
             local name="$1"
             local value="$2"
@@ -266,21 +263,17 @@ jobs:
             echo "Set secret $name"
           }
 
-          # Install GitHub CLI if not present (ubuntu-latest already has it)
           which gh || (apt-get update -qq && apt-get install -y -qq gh)
 
-          # Set the four repository variables
           set_var "AWS_ROLE_ARN"               "$ROLE_ARN"
           set_var "TF_OUT_ECR_REPOSITORY_URL"  "$ECR_URL"
           set_var "TF_OUT_EC2_PUBLIC_IP"        "$EC2_IP"
           set_var "TF_OUT_ALB_DNS_NAME"         "$ALB_DNS"
 
-          # Set the SSH private key as a repository secret
           set_secret "EC2_SSH_KEY" "$PRIVKEY"
 
           echo "All repository variables and EC2_SSH_KEY secret have been set."
 
-  # ---------------------------------------------------------------------------
   notify-failure:
     name: "Notify on failure"
     needs: terraform
@@ -290,5 +283,5 @@ jobs:
       - name: Annotate failure
         run: |
           echo "::error::Terraform infra workflow failed. Check the logs above."
-          echo "## ❌ Infra workflow failed" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Infra workflow failed" >> "$GITHUB_STEP_SUMMARY"
           echo "Check the job logs for details." >> "$GITHUB_STEP_SUMMARY"
