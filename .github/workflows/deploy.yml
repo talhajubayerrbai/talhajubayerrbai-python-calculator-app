@@ -1,21 +1,16 @@
 ###############################################################################
 # deploy.yml — Build, push to ECR, and deploy to RKE2 via Helm
 #
-# Uses static AWS credentials (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY)
-# instead of OIDC role assumption — the OIDC trust was misconfigured and
-# caused 'Could not load credentials from any providers'.
+# Authentication: static AWS IAM credentials via AWS_ACCESS_KEY_ID /
+# AWS_SECRET_ACCESS_KEY (written by set_pipeline_account).
 #
-# Prerequisites (set by UDAP via set_pipeline_account):
-#   Repository secrets:
-#     AWS_ACCESS_KEY_ID       — AWS access key
-#     AWS_SECRET_ACCESS_KEY   — AWS secret key
-#     EC2_SSH_KEY             — PEM private key for SSH into the EC2 instance
-#
+# Prerequisites (set by infra.yml after terraform apply):
 #   Repository variables:
-#     AWS_REGION              — e.g. us-east-1  (set by set_pipeline_account)
-#     TF_OUT_ECR_REPOSITORY_URL — set by infra.yml after terraform apply
-#     TF_OUT_EC2_PUBLIC_IP      — set by infra.yml after terraform apply
-#     TF_OUT_ALB_DNS_NAME       — set by infra.yml after terraform apply
+#     TF_OUT_ECR_REPOSITORY_URL — ECR repository URL
+#     TF_OUT_EC2_PUBLIC_IP      — EC2 instance public IP
+#     TF_OUT_ALB_DNS_NAME       — ALB DNS name
+#   Repository secrets:
+#     EC2_SSH_KEY               — PEM private key for SSH into the EC2 instance
 ###############################################################################
 
 name: "Deploy — Build, Push & Helm Deploy"
@@ -24,16 +19,16 @@ on:
   workflow_dispatch:
     inputs:
       revision:
-        description: "Git ref or SHA to deploy"
+        description: "Git ref to deploy"
         required: false
-        default: ""
       udap_run_id:
-        description: "UDAP run ID (injected by platform)"
+        description: "UDAP run id"
         required: false
-        default: ""
+
+permissions:
+  contents: read
 
 env:
-  AWS_REGION:     us-east-1
   IMAGE_NAME:     calculator-app
   HELM_RELEASE:   calculator
   HELM_CHART_DIR: ./charts/calculator
@@ -60,13 +55,13 @@ jobs:
           echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
           echo "Short SHA: $SHORT_SHA"
 
-      # ── 2. Authenticate to AWS via static credentials ─────────────────────────
+      # ── 2. Authenticate to AWS (static key) ──────────────────────────────────
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region:            ${{ vars.AWS_REGION || env.AWS_REGION }}
+          aws-region:            ${{ vars.AWS_REGION }}
 
       # ── 3. Log in to Amazon ECR ──────────────────────────────────────────────
       - name: Log in to Amazon ECR
@@ -86,19 +81,17 @@ jobs:
             --file Dockerfile \
             .
 
-      # ── 5. Push image to ECR (both tags) ─────────────────────────────────────
+      # ── 5. Push image to ECR ─────────────────────────────────────────────────
       - name: Push image to ECR
         env:
           ECR_URL:   ${{ vars.TF_OUT_ECR_REPOSITORY_URL }}
           SHORT_SHA: ${{ steps.sha.outputs.short_sha }}
         run: |
-          echo "Pushing $ECR_URL:$SHORT_SHA ..."
           docker push "$ECR_URL:$SHORT_SHA"
-          echo "Pushing $ECR_URL:latest ..."
           docker push "$ECR_URL:latest"
-          echo "All tags pushed to ECR"
+          echo "Both tags pushed to ECR"
 
-      # ── 6. SSH deploy via Helm on the RKE2 node ──────────────────────────────
+      # ── 6. Deploy via Helm on the RKE2 node (SSH) ────────────────────────────
       - name: Set up SSH agent
         uses: webfactory/ssh-agent@v0.9.0
         with:
@@ -118,59 +111,55 @@ jobs:
         env:
           EC2_IP: ${{ vars.TF_OUT_EC2_PUBLIC_IP }}
         run: |
-          echo "Copying charts/ to EC2 instance..."
           ssh ec2-user@"$EC2_IP" "rm -rf ~/charts"
           scp -r charts/ ec2-user@"$EC2_IP":~/charts
           echo "Chart directory copied"
 
-      - name: Patch kubeconfig and verify cluster
-        env:
-          EC2_IP: ${{ vars.TF_OUT_EC2_PUBLIC_IP }}
-        run: |
-          ssh ec2-user@"$EC2_IP" bash << 'ENDSSH'
-          set -euo pipefail
-          KUBECONFIG_SRC=/etc/rancher/rke2/rke2.yaml
-          KUBECONFIG_DEST=$HOME/.kube/config
-          mkdir -p "$HOME/.kube"
-          sudo cp "$KUBECONFIG_SRC" "$KUBECONFIG_DEST"
-          sudo chown "$(id -u):$(id -g)" "$KUBECONFIG_DEST"
-          chmod 600 "$KUBECONFIG_DEST"
-          sed -i 's|https://[^"]*:6443|https://127.0.0.1:6443|g' "$KUBECONFIG_DEST"
-          echo "kubeconfig patched"
-          /var/lib/rancher/rke2/bin/kubectl --kubeconfig "$KUBECONFIG_DEST" get nodes
-          echo "Cluster is reachable"
-          ENDSSH
-
-      - name: Helm upgrade --install
+      - name: Helm upgrade --install on RKE2 node
         env:
           EC2_IP:    ${{ vars.TF_OUT_EC2_PUBLIC_IP }}
           ECR_URL:   ${{ vars.TF_OUT_ECR_REPOSITORY_URL }}
           SHORT_SHA: ${{ steps.sha.outputs.short_sha }}
-          NODE_PORT: ${{ env.NODE_PORT }}
-          HELM_RELEASE: ${{ env.HELM_RELEASE }}
         run: |
+          # Patch kubeconfig and verify cluster
+          ssh ec2-user@"$EC2_IP" bash -s <<'ENDSSH'
+            set -euo pipefail
+            KUBECONFIG_SRC=/etc/rancher/rke2/rke2.yaml
+            KUBECONFIG_DEST=$HOME/.kube/config
+            mkdir -p "$HOME/.kube"
+            sudo cp "$KUBECONFIG_SRC" "$KUBECONFIG_DEST"
+            sudo chown "$(id -u):$(id -g)" "$KUBECONFIG_DEST"
+            chmod 600 "$KUBECONFIG_DEST"
+            sed -i 's|https://[^"]*:6443|https://127.0.0.1:6443|g' "$KUBECONFIG_DEST"
+            echo "kubeconfig patched"
+            export KUBECONFIG="$KUBECONFIG_DEST"
+            /var/lib/rancher/rke2/bin/kubectl --kubeconfig "$KUBECONFIG_DEST" get nodes
+            echo "Cluster is reachable"
+          ENDSSH
+
+          # Run helm deploy passing env vars explicitly
           ssh ec2-user@"$EC2_IP" \
             ECR_URL="$ECR_URL" \
             SHORT_SHA="$SHORT_SHA" \
-            NODE_PORT="$NODE_PORT" \
-            HELM_RELEASE="$HELM_RELEASE" \
-            bash << 'ENDSSH'
-          set -euo pipefail
-          export KUBECONFIG="$HOME/.kube/config"
-          export PATH="/usr/local/bin:/var/lib/rancher/rke2/bin:$PATH"
-          echo "Deploying image: $ECR_URL:$SHORT_SHA"
-          helm upgrade --install "$HELM_RELEASE" ~/charts/calculator \
-            --set image.repository="$ECR_URL" \
-            --set image.tag="$SHORT_SHA" \
-            --set service.nodePort="$NODE_PORT" \
-            --wait \
-            --timeout 5m \
-            --atomic
-          echo "Helm deploy complete"
-          helm status "$HELM_RELEASE"
+            NODE_PORT="${{ env.NODE_PORT }}" \
+            HELM_RELEASE="${{ env.HELM_RELEASE }}" \
+            bash -s <<'ENDSSH'
+            set -euo pipefail
+            export KUBECONFIG="$HOME/.kube/config"
+            export PATH="/usr/local/bin:/var/lib/rancher/rke2/bin:$PATH"
+            echo "Deploying image: $ECR_URL:$SHORT_SHA"
+            helm upgrade --install "$HELM_RELEASE" ~/charts/calculator \
+              --set image.repository="$ECR_URL" \
+              --set image.tag="$SHORT_SHA" \
+              --set service.nodePort="$NODE_PORT" \
+              --wait \
+              --timeout 5m \
+              --atomic
+            echo "Helm deploy complete"
+            helm status "$HELM_RELEASE"
           ENDSSH
 
-      # ── 7. Smoke-test: curl the ALB /health endpoint ─────────────────────────
+      # ── 7. Smoke-test and emit live address ───────────────────────────────────
       - name: Smoke test — ALB /health
         env:
           ALB_DNS: ${{ vars.TF_OUT_ALB_DNS_NAME }}
@@ -180,18 +169,20 @@ jobs:
             HTTP_STATUS=$(curl --silent --output /dev/null \
               --write-out '%{http_code}' \
               --max-time 10 \
-              "http://$ALB_DNS/health" || echo "000")
+              "http://$ALB_DNS/health" || true)
             echo "Attempt $i: HTTP $HTTP_STATUS"
             if [ "$HTTP_STATUS" = "200" ]; then
-              BODY=$(curl --silent --fail --max-time 10 "http://$ALB_DNS/health")
-              echo "Response: $BODY"
-              echo "Live URL: http://$ALB_DNS"
-              exit 0
+              echo "Health check passed"
+              break
+            fi
+            if [ "$i" -eq 24 ]; then
+              echo "::error::ALB /health did not return 200 after 2 minutes"
+              exit 1
             fi
             sleep 5
           done
-          echo "ERROR: ALB /health did not return 200 after 120 s"
-          exit 1
+          # Emit the live URL for UDAP placement tracking
+          echo "Live URL: http://$ALB_DNS"
 
       # ── 8. Job summary ────────────────────────────────────────────────────────
       - name: Write job summary
@@ -201,9 +192,12 @@ jobs:
           SHORT_SHA: ${{ steps.sha.outputs.short_sha }}
           ALB_DNS:   ${{ vars.TF_OUT_ALB_DNS_NAME }}
         run: |
-          echo "## Deploy succeeded" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Item | Value |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|------|-------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Image | \`$ECR_URL:$SHORT_SHA\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| ALB endpoint | http://$ALB_DNS |" >> "$GITHUB_STEP_SUMMARY"
-          echo "Live URL: http://$ALB_DNS" >> "$GITHUB_STEP_SUMMARY"
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## Deploy succeeded
+          | Item | Value |
+          |------|-------|
+          | Image | \`$ECR_URL:$SHORT_SHA\` |
+          | Helm release | \`${{ env.HELM_RELEASE }}\` |
+          | Live URL | http://$ALB_DNS |
+          EOF
+          echo "Live URL: http://$ALB_DNS"
