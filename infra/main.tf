@@ -62,7 +62,7 @@ resource "aws_internet_gateway" "main" {
   tags = merge(local.common_tags, { Name = "${var.project}-igw" })
 }
 
-# Primary subnet — AZ a — EC2 lives here
+# Primary subnet -- AZ a -- EC2 lives here
 resource "aws_subnet" "public" {
   vpc_id                  = aws_vpc.main.id
   cidr_block              = "10.0.1.0/24"
@@ -72,7 +72,7 @@ resource "aws_subnet" "public" {
   tags = merge(local.common_tags, { Name = "${var.project}-public-subnet-a" })
 }
 
-# Secondary subnet — AZ b — required for ALB (must span ≥2 AZs)
+# Secondary subnet -- AZ b -- required for ALB (must span >= 2 AZs)
 resource "aws_subnet" "public_b" {
   vpc_id                  = aws_vpc.main.id
   cidr_block              = "10.0.2.0/24"
@@ -110,7 +110,7 @@ resource "aws_route_table_association" "public_b" {
 # ALB: accepts HTTP 80 from anywhere
 resource "aws_security_group" "alb" {
   name        = "${var.project}-alb-sg"
-  description = "ALB — inbound HTTP 80 from internet; outbound all"
+  description = "ALB - inbound HTTP 80 from internet; outbound all"
   vpc_id      = aws_vpc.main.id
 
   ingress {
@@ -135,7 +135,7 @@ resource "aws_security_group" "alb" {
 # EC2: NodePort 30080 from ALB SG only; SSH 22 from anywhere (dev)
 resource "aws_security_group" "ec2" {
   name        = "${var.project}-ec2-sg"
-  description = "EC2 — NodePort 30080 from ALB SG; SSH 22 from anywhere; outbound all"
+  description = "EC2 - NodePort 30080 from ALB SG; SSH 22 from anywhere; outbound all"
   vpc_id      = aws_vpc.main.id
 
   ingress {
@@ -147,7 +147,7 @@ resource "aws_security_group" "ec2" {
   }
 
   ingress {
-    description = "SSH — dev convenience"
+    description = "SSH - dev convenience"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
@@ -166,7 +166,7 @@ resource "aws_security_group" "ec2" {
 }
 
 ###############################################################################
-# AMI — latest Amazon Linux 2023 x86_64
+# AMI -- latest Amazon Linux 2023 x86_64
 ###############################################################################
 
 data "aws_ami" "al2023" {
@@ -195,7 +195,7 @@ data "aws_ami" "al2023" {
 }
 
 ###############################################################################
-# IAM — EC2 instance role (ECR read + SSM)
+# IAM -- EC2 instance role (ECR read + SSM)
 ###############################################################################
 
 resource "aws_iam_role" "ec2" {
@@ -231,7 +231,7 @@ resource "aws_iam_instance_profile" "ec2" {
 }
 
 ###############################################################################
-# IAM OIDC — GitHub Actions role (ECR push + EC2 describe)
+# IAM OIDC -- GitHub Actions role (ECR push + EC2 describe)
 ###############################################################################
 
 # Retrieve the OIDC thumbprint for token.actions.githubusercontent.com
@@ -324,7 +324,7 @@ resource "aws_iam_role_policy" "github_actions" {
 }
 
 ###############################################################################
-# EC2 — single-node RKE2 Kubernetes
+# EC2 -- single-node RKE2 Kubernetes
 ###############################################################################
 
 resource "aws_instance" "rke2" {
@@ -355,7 +355,7 @@ resource "aws_instance" "rke2" {
 }
 
 ###############################################################################
-# ECR — container image registry for the calculator app
+# ECR -- container image registry for the calculator app
 ###############################################################################
 
 resource "aws_ecr_repository" "calculator" {
@@ -405,7 +405,7 @@ resource "aws_ecr_lifecycle_policy" "calculator" {
 }
 
 ###############################################################################
-# ALB — internet-facing, HTTP 80 → NodePort 30080
+# ALB -- internet-facing, HTTP 80 -> NodePort 30080
 # ALB requires subnets in at least 2 AZs.
 ###############################################################################
 
