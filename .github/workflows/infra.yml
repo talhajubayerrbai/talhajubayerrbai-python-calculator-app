@@ -1,5 +1,6 @@
 ###############################################################################
 # infra.yml — Terraform plan + apply for the calculator-app AWS infrastructure
+# Fix: hardcode AWS_REGION fallback; add diagnostic output for each step
 ###############################################################################
 
 name: "Infra — Terraform Plan & Apply"
@@ -40,6 +41,8 @@ permissions:
 env:
   TF_VERSION:  "1.7.5"
   WORKING_DIR: "./infra"
+  # Fallback region in case vars.AWS_REGION is not set
+  DEFAULT_REGION: "us-east-1"
 
 jobs:
   terraform:
@@ -63,12 +66,34 @@ jobs:
         with:
           ref: ${{ inputs.revision || github.sha }}
 
+      - name: Resolve AWS region
+        id: region
+        shell: bash
+        working-directory: .
+        run: |
+          # Use vars.AWS_REGION if set; fall back to us-east-1
+          REGION="${{ vars.AWS_REGION }}"
+          if [ -z "$REGION" ]; then
+            REGION="us-east-1"
+            echo "vars.AWS_REGION is not set, falling back to us-east-1"
+          fi
+          echo "Using region: $REGION"
+          echo "aws_region=$REGION" >> "$GITHUB_OUTPUT"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region:            ${{ vars.AWS_REGION }}
+          aws-region:            ${{ steps.region.outputs.aws_region }}
+
+      - name: Verify AWS identity
+        shell: bash
+        working-directory: .
+        run: |
+          echo "AWS identity:"
+          aws sts get-caller-identity
+          echo "Region: ${{ steps.region.outputs.aws_region }}"
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -84,22 +109,36 @@ jobs:
       - name: Terraform Init
         id: init
         run: |
+          REGION="${{ steps.region.outputs.aws_region }}"
+          BUCKET="${{ secrets.TF_STATE_BUCKET }}"
+          KEY="${{ vars.TF_STATE_KEY }}"
+
+          if [ -z "$BUCKET" ]; then
+            BUCKET="udap-calculator-tf-state-a7f3k9"
+            echo "TF_STATE_BUCKET not set, using default: $BUCKET"
+          fi
+          if [ -z "$KEY" ]; then
+            KEY="calculator/terraform.tfstate"
+            echo "TF_STATE_KEY not set, using default: $KEY"
+          fi
+
           echo "STEP: terraform init"
-          echo "Bucket secret set: ${{ secrets.TF_STATE_BUCKET != '' && 'YES' || 'NO - EMPTY' }}"
-          echo "Key var: ${{ vars.TF_STATE_KEY }}"
-          echo "Region var: ${{ vars.AWS_REGION }}"
+          echo "  Bucket: $BUCKET"
+          echo "  Key:    $KEY"
+          echo "  Region: $REGION"
+
           terraform init \
             -input=false \
             -reconfigure \
-            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
-            -backend-config="key=${{ vars.TF_STATE_KEY }}" \
-            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="bucket=$BUCKET" \
+            -backend-config="key=$KEY" \
+            -backend-config="region=$REGION" \
             -backend-config="encrypt=true"
           echo "STEP: init SUCCESS"
         env:
           AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_REGION:            ${{ vars.AWS_REGION }}
+          AWS_REGION:            ${{ steps.region.outputs.aws_region }}
 
       - name: Terraform Validate
         id: validate
@@ -118,9 +157,15 @@ jobs:
             -input=false \
             -out=tfplan \
             2>&1 | tee plan_output.txt
+          PLAN_EXIT=${PIPESTATUS[0]}
+          if [ "$PLAN_EXIT" -ne 0 ]; then
+            echo "::error::terraform plan failed with exit code $PLAN_EXIT"
+            cat plan_output.txt
+            exit "$PLAN_EXIT"
+          fi
           echo "STEP: plan SUCCESS"
         env:
-          TF_VAR_aws_region: ${{ vars.AWS_REGION }}
+          TF_VAR_aws_region: ${{ steps.region.outputs.aws_region }}
 
       - name: Comment plan on PR
         if: github.event_name == 'pull_request'
@@ -153,7 +198,7 @@ jobs:
             tfplan
           echo "STEP: apply SUCCESS"
         env:
-          TF_VAR_aws_region: ${{ vars.AWS_REGION }}
+          TF_VAR_aws_region: ${{ steps.region.outputs.aws_region }}
 
       - name: Terraform Destroy
         id: destroy
@@ -164,7 +209,7 @@ jobs:
             -input=false \
             -auto-approve
         env:
-          TF_VAR_aws_region: ${{ vars.AWS_REGION }}
+          TF_VAR_aws_region: ${{ steps.region.outputs.aws_region }}
 
       - name: Capture Terraform outputs
         id: tf_output
@@ -186,7 +231,7 @@ jobs:
             "$EC2_IP" "$ALB_DNS" "$ECR_URL" "$ROLE_ARN" >> "$GITHUB_STEP_SUMMARY"
 
           echo "Live URL: http://$EC2_IP"
-          echo "STEP: capture outputs DONE — EC2_IP=$EC2_IP ALB=$ALB_DNS"
+          echo "STEP: capture outputs DONE -- EC2_IP=$EC2_IP ALB=$ALB_DNS"
 
       - name: Retrieve private key
         id: privkey
@@ -235,6 +280,7 @@ jobs:
           set_var "TF_OUT_ECR_REPOSITORY_URL"  "$ECR_URL"
           set_var "TF_OUT_EC2_PUBLIC_IP"        "$EC2_IP"
           set_var "TF_OUT_ALB_DNS_NAME"         "$ALB_DNS"
+          set_var "AWS_REGION"                  "${{ steps.region.outputs.aws_region }}"
           echo "All variables and EC2_SSH_KEY set."
 
   notify-failure:
@@ -247,3 +293,4 @@ jobs:
         run: |
           echo "::error::Terraform infra workflow failed. Check the logs above."
           echo "## Infra workflow failed" >> "$GITHUB_STEP_SUMMARY"
+          echo "Check the job logs for details." >> "$GITHUB_STEP_SUMMARY"
