@@ -62,13 +62,24 @@ resource "aws_internet_gateway" "main" {
   tags = merge(local.common_tags, { Name = "${var.project}-igw" })
 }
 
+# Primary subnet — AZ a — EC2 lives here
 resource "aws_subnet" "public" {
   vpc_id                  = aws_vpc.main.id
   cidr_block              = "10.0.1.0/24"
   availability_zone       = "${var.aws_region}a"
   map_public_ip_on_launch = true
 
-  tags = merge(local.common_tags, { Name = "${var.project}-public-subnet" })
+  tags = merge(local.common_tags, { Name = "${var.project}-public-subnet-a" })
+}
+
+# Secondary subnet — AZ b — required for ALB (must span ≥2 AZs)
+resource "aws_subnet" "public_b" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.0.2.0/24"
+  availability_zone       = "${var.aws_region}b"
+  map_public_ip_on_launch = true
+
+  tags = merge(local.common_tags, { Name = "${var.project}-public-subnet-b" })
 }
 
 resource "aws_route_table" "public" {
@@ -84,6 +95,11 @@ resource "aws_route_table" "public" {
 
 resource "aws_route_table_association" "public" {
   subnet_id      = aws_subnet.public.id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_route_table_association" "public_b" {
+  subnet_id      = aws_subnet.public_b.id
   route_table_id = aws_route_table.public.id
 }
 
@@ -250,8 +266,6 @@ resource "aws_iam_role" "github_actions" {
             "${local.github_oidc_url}:aud" = local.github_oidc_audience
           }
           StringLike = {
-            # Scope to this repository; sub format:
-            # repo:<owner>/<repo>:ref:refs/heads/<branch>
             "${local.github_oidc_url}:sub" = "repo:${var.github_repo}:*"
           }
         }
@@ -262,7 +276,7 @@ resource "aws_iam_role" "github_actions" {
   tags = merge(local.common_tags, { Name = "${var.project}-github-actions-role" })
 }
 
-# Inline policy: ECR push (push image, auth token) + EC2 describe
+# Inline policy: ECR push + EC2 describe
 resource "aws_iam_role_policy" "github_actions" {
   name = "${var.project}-github-actions-policy"
   role = aws_iam_role.github_actions.id
@@ -270,14 +284,12 @@ resource "aws_iam_role_policy" "github_actions" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
-      # ECR authentication token
       {
-        Sid    = "ECRAuth"
-        Effect = "Allow"
-        Action = ["ecr:GetAuthorizationToken"]
+        Sid      = "ECRAuth"
+        Effect   = "Allow"
+        Action   = ["ecr:GetAuthorizationToken"]
         Resource = ["*"]
       },
-      # ECR image push operations (scoped to the calculator-app repository)
       {
         Sid    = "ECRPush"
         Effect = "Allow"
@@ -295,7 +307,6 @@ resource "aws_iam_role_policy" "github_actions" {
         ]
         Resource = [aws_ecr_repository.calculator.arn]
       },
-      # EC2 describe — read-only visibility for the deploy workflow
       {
         Sid    = "EC2Describe"
         Effect = "Allow"
@@ -395,6 +406,7 @@ resource "aws_ecr_lifecycle_policy" "calculator" {
 
 ###############################################################################
 # ALB — internet-facing, HTTP 80 → NodePort 30080
+# ALB requires subnets in at least 2 AZs.
 ###############################################################################
 
 resource "aws_lb" "main" {
@@ -402,7 +414,7 @@ resource "aws_lb" "main" {
   internal           = false
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb.id]
-  subnets            = [aws_subnet.public.id]
+  subnets            = [aws_subnet.public.id, aws_subnet.public_b.id]
 
   enable_deletion_protection = false
 

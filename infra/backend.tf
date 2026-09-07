@@ -1,10 +1,12 @@
 ###############################################################################
-# backend.tf — remote state in S3 + DynamoDB locking; provider requirements
+# backend.tf — remote state in S3; provider requirements
 #
-# The S3 bucket and DynamoDB table must exist BEFORE running `terraform init`.
-# They were bootstrapped in Session 1:
-#   Bucket : udap-calculator-tf-state-a7f3k9   (us-east-1, versioning enabled)
-#   Table  : udap-calculator-tf-lock           (PAY_PER_REQUEST, LockID PK)
+# Backend bucket, key and region are injected at `terraform init` time via
+# -backend-config flags from the workflow. Do NOT hardcode them here.
+# set_pipeline_account wrote:
+#   secrets.TF_STATE_BUCKET — S3 bucket name
+#   vars.TF_STATE_KEY       — S3 object key
+#   vars.AWS_REGION         — AWS region
 ###############################################################################
 
 terraform {
@@ -25,13 +27,9 @@ terraform {
     }
   }
 
-  backend "s3" {
-    bucket         = "udap-calculator-tf-state-a7f3k9"
-    key            = "calculator-app/terraform.tfstate"
-    region         = "us-east-1"
-    encrypt        = true
-    dynamodb_table = "udap-calculator-tf-lock"
-  }
+  # Partial backend configuration: bucket/key/region supplied by -backend-config
+  # flags in the CI workflow (infra.yml). This keeps credentials out of source.
+  backend "s3" {}
 }
 
 provider "aws" {

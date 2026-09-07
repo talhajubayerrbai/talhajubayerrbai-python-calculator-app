@@ -22,11 +22,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write     # needed if OIDC ever replaces static keys here
-
-env:
-  AWS_REGION:  "us-east-1"
-  WORKING_DIR: "./infra"
 
 jobs:
   read-outputs:
@@ -35,7 +30,7 @@ jobs:
 
     defaults:
       run:
-        working-directory: ${{ env.WORKING_DIR }}
+        working-directory: ./infra
 
     steps:
       - name: Checkout
@@ -48,7 +43,7 @@ jobs:
         with:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region:            ${{ env.AWS_REGION }}
+          aws-region:            ${{ vars.AWS_REGION }}
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -63,9 +58,8 @@ jobs:
             -reconfigure \
             -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
             -backend-config="key=${{ vars.TF_STATE_KEY }}" \
-            -backend-config="region=us-east-1" \
-            -backend-config="encrypt=true" \
-            -backend-config="dynamodb_table=udap-calculator-tf-lock"
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="encrypt=true"
 
       - name: Read Terraform outputs
         id: tf_output
@@ -94,7 +88,6 @@ jobs:
           echo "| ecr_repository_url | \`$ECR_URL\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| aws_role_arn | \`$ROLE_ARN\` |"  >> "$GITHUB_STEP_SUMMARY"
 
-          # Surface for UDAP placement detection
           echo "Live URL: http://$ALB_DNS"
 
       - name: Set repository variables and EC2_SSH_KEY secret
@@ -135,9 +128,3 @@ jobs:
           set_var "TF_OUT_ALB_DNS_NAME"         "$ALB_DNS"
 
           echo "All variables and EC2_SSH_KEY secret set."
-          echo "## Variables Set" >> "$GITHUB_STEP_SUMMARY"
-          echo "- AWS_ROLE_ARN" >> "$GITHUB_STEP_SUMMARY"
-          echo "- TF_OUT_ECR_REPOSITORY_URL" >> "$GITHUB_STEP_SUMMARY"
-          echo "- TF_OUT_EC2_PUBLIC_IP" >> "$GITHUB_STEP_SUMMARY"
-          echo "- TF_OUT_ALB_DNS_NAME" >> "$GITHUB_STEP_SUMMARY"
-          echo "- EC2_SSH_KEY (secret)" >> "$GITHUB_STEP_SUMMARY"
