@@ -1,0 +1,142 @@
+###############################################################################
+# get-outputs.yml — Read Terraform outputs from existing state and set
+# GitHub repository variables + EC2_SSH_KEY secret.
+#
+# Runs on: workflow_dispatch only.
+# Purpose: Re-sync repository variables from Terraform state without re-applying.
+###############################################################################
+
+name: "Infra — Read Outputs & Set Variables"
+
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: "Git ref to checkout"
+        required: false
+        default: ""
+      udap_run_id:
+        description: "UDAP run id (platform metadata)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION:  "us-east-1"
+  WORKING_DIR: "./infra"
+
+jobs:
+  read-outputs:
+    name: "Read Terraform outputs and set repo variables"
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.revision || github.sha }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+          terraform_wrapper: false
+
+      - name: Terraform Init (read-only, existing state)
+        run: |
+          terraform init \
+            -input=false \
+            -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ vars.TF_STATE_KEY }}" \
+            -backend-config="region=us-east-1" \
+            -backend-config="encrypt=true" \
+            -backend-config="dynamodb_table=udap-calculator-tf-lock"
+
+      - name: Read Terraform outputs
+        id: tf_output
+        run: |
+          EC2_IP=$(terraform output -raw ec2_public_ip         2>/dev/null || echo "")
+          ALB_DNS=$(terraform output -raw alb_dns_name         2>/dev/null || echo "")
+          ECR_URL=$(terraform output -raw ecr_repository_url   2>/dev/null || echo "")
+          ROLE_ARN=$(terraform output -raw aws_role_arn        2>/dev/null || echo "")
+          PRIVKEY=$(terraform output -raw ec2_private_key_pem  2>/dev/null || echo "")
+
+          echo "::add-mask::$PRIVKEY"
+
+          echo "ec2_public_ip=$EC2_IP"       >> "$GITHUB_OUTPUT"
+          echo "alb_dns_name=$ALB_DNS"       >> "$GITHUB_OUTPUT"
+          echo "ecr_repository_url=$ECR_URL" >> "$GITHUB_OUTPUT"
+          echo "aws_role_arn=$ROLE_ARN"      >> "$GITHUB_OUTPUT"
+          echo "pem<<KEYEOF"                  >> "$GITHUB_OUTPUT"
+          echo "$PRIVKEY"                     >> "$GITHUB_OUTPUT"
+          echo "KEYEOF"                       >> "$GITHUB_OUTPUT"
+
+          echo "## Terraform Outputs (from state)" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Output | Value |"                >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|-------|"                >> "$GITHUB_STEP_SUMMARY"
+          echo "| ec2_public_ip | \`$EC2_IP\` |"  >> "$GITHUB_STEP_SUMMARY"
+          echo "| alb_dns_name | \`$ALB_DNS\` |"  >> "$GITHUB_STEP_SUMMARY"
+          echo "| ecr_repository_url | \`$ECR_URL\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| aws_role_arn | \`$ROLE_ARN\` |"  >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Live URL: http://$ALB_DNS"
+
+      - name: Set repository variables and EC2_SSH_KEY secret
+        env:
+          GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
+          REPO:      ${{ github.repository }}
+          ALB_DNS:   ${{ steps.tf_output.outputs.alb_dns_name }}
+          ECR_URL:   ${{ steps.tf_output.outputs.ecr_repository_url }}
+          EC2_IP:    ${{ steps.tf_output.outputs.ec2_public_ip }}
+          ROLE_ARN:  ${{ steps.tf_output.outputs.aws_role_arn }}
+          PRIVKEY:   ${{ steps.tf_output.outputs.pem }}
+        run: |
+          API="https://api.github.com"
+          AUTH=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
+
+          set_var() {
+            local name="$1"; local value="$2"
+            HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+              -X PATCH "${AUTH[@]}" \
+              "$API/repos/$REPO/actions/variables/$name" \
+              -d "{\"name\":\"$name\",\"value\":\"$value\"}")
+            if [ "$HTTP" != "204" ]; then
+              curl -sf -X POST "${AUTH[@]}" \
+                "$API/repos/$REPO/actions/variables" \
+                -d "{\"name\":\"$name\",\"value\":\"$value\"}"
+              echo "Created variable $name"
+            else
+              echo "Updated variable $name"
+            fi
+          }
+
+          printf '%s' "$PRIVKEY" | gh secret set "EC2_SSH_KEY" --repo "$REPO" --body -
+          echo "Set secret EC2_SSH_KEY"
+
+          set_var "AWS_ROLE_ARN"               "$ROLE_ARN"
+          set_var "TF_OUT_ECR_REPOSITORY_URL"  "$ECR_URL"
+          set_var "TF_OUT_EC2_PUBLIC_IP"        "$EC2_IP"
+          set_var "TF_OUT_ALB_DNS_NAME"         "$ALB_DNS"
+
+          echo "All variables and EC2_SSH_KEY secret set."
+          echo "## Variables Set" >> "$GITHUB_STEP_SUMMARY"
+          echo "- AWS_ROLE_ARN" >> "$GITHUB_STEP_SUMMARY"
+          echo "- TF_OUT_ECR_REPOSITORY_URL" >> "$GITHUB_STEP_SUMMARY"
+          echo "- TF_OUT_EC2_PUBLIC_IP" >> "$GITHUB_STEP_SUMMARY"
+          echo "- TF_OUT_ALB_DNS_NAME" >> "$GITHUB_STEP_SUMMARY"
+          echo "- EC2_SSH_KEY (secret)" >> "$GITHUB_STEP_SUMMARY"
