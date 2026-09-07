@@ -1,5 +1,5 @@
 ###############################################################################
-# main.tf — VPC, security groups, AMI, EC2, IAM, ECR, ALB
+# main.tf — VPC, security groups, AMI, EC2, IAM, ECR, ALB, OIDC
 ###############################################################################
 
 ###############################################################################
@@ -12,6 +12,36 @@ locals {
     Environment = var.environment
     ManagedBy   = "terraform"
   }
+
+  # GitHub OIDC audience used by aws-actions/configure-aws-credentials
+  github_oidc_url      = "token.actions.githubusercontent.com"
+  github_oidc_audience = "sts.amazonaws.com"
+}
+
+###############################################################################
+# Current caller identity (used to build ARNs)
+###############################################################################
+
+data "aws_caller_identity" "current" {}
+
+###############################################################################
+# TLS private key — generated once, stored in state (sensitive)
+###############################################################################
+
+resource "tls_private_key" "ec2" {
+  algorithm = "RSA"
+  rsa_bits  = 4096
+}
+
+###############################################################################
+# EC2 Key Pair — uploads the public half to AWS
+###############################################################################
+
+resource "aws_key_pair" "ec2" {
+  key_name   = "${var.project}-ec2-key"
+  public_key = tls_private_key.ec2.public_key_openssh
+
+  tags = merge(local.common_tags, { Name = "${var.project}-ec2-key" })
 }
 
 ###############################################################################
@@ -185,6 +215,104 @@ resource "aws_iam_instance_profile" "ec2" {
 }
 
 ###############################################################################
+# IAM OIDC — GitHub Actions role (ECR push + EC2 describe)
+###############################################################################
+
+# Retrieve the OIDC thumbprint for token.actions.githubusercontent.com
+data "tls_certificate" "github_oidc" {
+  url = "https://${local.github_oidc_url}"
+}
+
+# Register the GitHub OIDC provider in this AWS account (idempotent)
+resource "aws_iam_openid_connect_provider" "github" {
+  url             = "https://${local.github_oidc_url}"
+  client_id_list  = [local.github_oidc_audience]
+  thumbprint_list = [data.tls_certificate.github_oidc.certificates[0].sha1_fingerprint]
+
+  tags = merge(local.common_tags, { Name = "github-oidc" })
+}
+
+# IAM role that GitHub Actions workflows assume via OIDC
+resource "aws_iam_role" "github_actions" {
+  name = "${var.project}-github-actions-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Federated = aws_iam_openid_connect_provider.github.arn
+        }
+        Action = "sts:AssumeRoleWithWebIdentity"
+        Condition = {
+          StringEquals = {
+            "${local.github_oidc_url}:aud" = local.github_oidc_audience
+          }
+          StringLike = {
+            # Scope to this repository; sub format:
+            # repo:<owner>/<repo>:ref:refs/heads/<branch>
+            "${local.github_oidc_url}:sub" = "repo:${var.github_repo}:*"
+          }
+        }
+      }
+    ]
+  })
+
+  tags = merge(local.common_tags, { Name = "${var.project}-github-actions-role" })
+}
+
+# Inline policy: ECR push (push image, auth token) + EC2 describe
+resource "aws_iam_role_policy" "github_actions" {
+  name = "${var.project}-github-actions-policy"
+  role = aws_iam_role.github_actions.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      # ECR authentication token
+      {
+        Sid    = "ECRAuth"
+        Effect = "Allow"
+        Action = ["ecr:GetAuthorizationToken"]
+        Resource = ["*"]
+      },
+      # ECR image push operations (scoped to the calculator-app repository)
+      {
+        Sid    = "ECRPush"
+        Effect = "Allow"
+        Action = [
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:BatchGetImage",
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:PutImage",
+          "ecr:InitiateLayerUpload",
+          "ecr:UploadLayerPart",
+          "ecr:CompleteLayerUpload",
+          "ecr:DescribeRepositories",
+          "ecr:ListImages",
+          "ecr:DescribeImages"
+        ]
+        Resource = [aws_ecr_repository.calculator.arn]
+      },
+      # EC2 describe — read-only visibility for the deploy workflow
+      {
+        Sid    = "EC2Describe"
+        Effect = "Allow"
+        Action = [
+          "ec2:DescribeInstances",
+          "ec2:DescribeInstanceStatus",
+          "ec2:DescribeSecurityGroups",
+          "ec2:DescribeSubnets",
+          "ec2:DescribeVpcs"
+        ]
+        Resource = ["*"]
+      }
+    ]
+  })
+}
+
+###############################################################################
 # EC2 — single-node RKE2 Kubernetes
 ###############################################################################
 
@@ -195,9 +323,7 @@ resource "aws_instance" "rke2" {
   vpc_security_group_ids      = [aws_security_group.ec2.id]
   associate_public_ip_address = true
   iam_instance_profile        = aws_iam_instance_profile.ec2.name
-
-  # key_name is optional — only set when variable is provided
-  key_name = var.ssh_key_name != "" ? var.ssh_key_name : null
+  key_name                    = aws_key_pair.ec2.key_name
 
   user_data = base64encode(templatefile("${path.module}/user_data.sh.tpl", {
     aws_region = var.aws_region
@@ -212,8 +338,6 @@ resource "aws_instance" "rke2" {
 
   tags = merge(local.common_tags, { Name = "${var.project}-rke2-node" })
 
-  # Replacing the AMI or tweaking user-data should be an intentional action,
-  # not an accidental drift-driven replacement.
   lifecycle {
     ignore_changes = [ami, user_data]
   }
@@ -280,8 +404,6 @@ resource "aws_lb" "main" {
   security_groups    = [aws_security_group.alb.id]
   subnets            = [aws_subnet.public.id]
 
-  # NOTE: ALBs require at least two subnets in different AZs for production.
-  # This single-subnet config is acceptable for a dev/single-node setup.
   enable_deletion_protection = false
 
   tags = merge(local.common_tags, { Name = "${var.project}-alb" })

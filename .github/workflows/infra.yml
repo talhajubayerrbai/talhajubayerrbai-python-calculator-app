@@ -1,17 +1,24 @@
 ###############################################################################
 # infra.yml — Terraform plan + apply for the calculator-app AWS infrastructure
 #
-# Triggers: push to main when any file under infra/ changes.
+# Triggers: push to main when any file under infra/ changes, or manual dispatch.
 #
-# Authentication: AWS credentials via the `udap-dev-aws` GitHub Actions secrets.
-# Secrets required in this repository:
-#   AWS_ACCESS_KEY_ID      — IAM user/role access key
-#   AWS_SECRET_ACCESS_KEY  — IAM user/role secret key
-#   AWS_REGION             — target region (us-east-1)
+# Authentication: static AWS IAM credentials (AWS_ACCESS_KEY_ID /
+# AWS_SECRET_ACCESS_KEY) stored as repository secrets.  These are the
+# bootstrap credentials required to CREATE the GitHub OIDC role; once the
+# role exists the application deploy workflow (deploy.yml) uses OIDC instead.
 #
-# After a successful apply, alb_dns_name and ecr_repository_url are stored as
-# GitHub Actions repository variables (TF_OUT_ALB_DNS_NAME, TF_OUT_ECR_URL)
-# for consumption by the application deploy workflow (Session 3).
+# After a successful apply the workflow writes four GitHub repository variables
+# and one repository secret that the deploy workflow consumes:
+#
+#   Variables  (readable by all workflows, shown in UI):
+#     AWS_ROLE_ARN               — IAM role ARN for OIDC assume
+#     TF_OUT_ECR_REPOSITORY_URL  — ECR repository URL
+#     TF_OUT_EC2_PUBLIC_IP       — EC2 instance public IP
+#     TF_OUT_ALB_DNS_NAME        — ALB DNS name
+#
+#   Secret  (write-only, never logged):
+#     EC2_SSH_KEY                — PEM private key for SSH access
 ###############################################################################
 
 name: "Infra — Terraform Plan & Apply"
@@ -41,18 +48,17 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write   # allows the workflow to post plan output as a PR comment
+  pull-requests: write
 
 env:
-  TF_VERSION: "1.7.5"
+  TF_VERSION:  "1.7.5"
   WORKING_DIR: "./infra"
-  AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+  AWS_REGION:  "us-east-1"
 
 jobs:
   terraform:
     name: "Terraform ${{ github.event_name == 'workflow_dispatch' && inputs.action || (github.event_name == 'pull_request' && 'plan') || 'apply' }}"
     runs-on: ubuntu-latest
-    environment: ${{ github.ref == 'refs/heads/main' && 'production' || 'preview' }}
 
     defaults:
       run:
@@ -62,6 +68,7 @@ jobs:
       ec2_public_ip:      ${{ steps.tf_output.outputs.ec2_public_ip }}
       alb_dns_name:       ${{ steps.tf_output.outputs.alb_dns_name }}
       ecr_repository_url: ${{ steps.tf_output.outputs.ecr_repository_url }}
+      aws_role_arn:       ${{ steps.tf_output.outputs.aws_role_arn }}
 
     steps:
       # -----------------------------------------------------------------------
@@ -69,6 +76,8 @@ jobs:
         uses: actions/checkout@v4
 
       # -----------------------------------------------------------------------
+      # Static IAM credentials — required for the bootstrap apply that creates
+      # the OIDC provider and role.  Subsequent workflows use the OIDC role.
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -81,7 +90,7 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
-          terraform_wrapper: true   # enables ::output:: capture
+          terraform_wrapper: false   # disable wrapper so raw output is captured
 
       # -----------------------------------------------------------------------
       - name: Terraform Format Check
@@ -94,6 +103,8 @@ jobs:
         id: init
         run: |
           terraform init \
+            -input=false \
+            -reconfigure \
             -backend-config="bucket=udap-calculator-tf-state-a7f3k9" \
             -backend-config="key=calculator-app/terraform.tfstate" \
             -backend-config="region=us-east-1" \
@@ -118,7 +129,6 @@ jobs:
           TF_VAR_aws_region: ${{ env.AWS_REGION }}
 
       # -----------------------------------------------------------------------
-      # Post plan as a PR comment for review
       - name: Comment plan on PR
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
@@ -167,20 +177,20 @@ jobs:
           TF_VAR_aws_region: ${{ env.AWS_REGION }}
 
       # -----------------------------------------------------------------------
-      # Capture outputs and persist as repo variables for the deploy workflow
       - name: Capture Terraform outputs
         id: tf_output
         if: steps.apply.outcome == 'success'
         run: |
-          EC2_IP=$(terraform output -raw ec2_public_ip   2>/dev/null || echo "")
-          ALB_DNS=$(terraform output -raw alb_dns_name   2>/dev/null || echo "")
-          ECR_URL=$(terraform output -raw ecr_repository_url 2>/dev/null || echo "")
+          EC2_IP=$(terraform output -raw ec2_public_ip         2>/dev/null || echo "")
+          ALB_DNS=$(terraform output -raw alb_dns_name         2>/dev/null || echo "")
+          ECR_URL=$(terraform output -raw ecr_repository_url   2>/dev/null || echo "")
+          ROLE_ARN=$(terraform output -raw aws_role_arn        2>/dev/null || echo "")
 
           echo "ec2_public_ip=$EC2_IP"       >> "$GITHUB_OUTPUT"
           echo "alb_dns_name=$ALB_DNS"       >> "$GITHUB_OUTPUT"
           echo "ecr_repository_url=$ECR_URL" >> "$GITHUB_OUTPUT"
+          echo "aws_role_arn=$ROLE_ARN"      >> "$GITHUB_OUTPUT"
 
-          # Also surface as step summary
           cat >> "$GITHUB_STEP_SUMMARY" <<EOF
           ## Infrastructure Outputs
           | Output | Value |
@@ -188,45 +198,89 @@ jobs:
           | ec2_public_ip | \`$EC2_IP\` |
           | alb_dns_name | \`$ALB_DNS\` |
           | ecr_repository_url | \`$ECR_URL\` |
+          | aws_role_arn | \`$ROLE_ARN\` |
           EOF
 
       # -----------------------------------------------------------------------
-      # Store outputs as GitHub Actions repository variables via the REST API
-      # so the deploy workflow (Session 3) can read them without re-running Terraform.
-      - name: Store outputs as repository variables
+      # Retrieve the sensitive private key (requires a second terraform output
+      # call with -json so the wrapper doesn't strip the value).
+      - name: Retrieve private key
+        id: privkey
+        if: steps.apply.outcome == 'success'
+        run: |
+          PRIVKEY=$(terraform output -raw ec2_private_key_pem 2>/dev/null || echo "")
+          # Mask the key so it is never echoed in plain text
+          echo "::add-mask::$PRIVKEY"
+          echo "pem<<KEYEOF" >> "$GITHUB_OUTPUT"
+          echo "$PRIVKEY"   >> "$GITHUB_OUTPUT"
+          echo "KEYEOF"     >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # Set repository variables and the EC2_SSH_KEY secret via REST API.
+      # GITHUB_TOKEN is a fine-grained token scoped to this repository; it has
+      # Actions:write and Secrets:write on the repo.
+      - name: Set repository variables and EC2_SSH_KEY secret
         if: steps.apply.outcome == 'success'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO:     ${{ github.repository }}
-          ALB_DNS:  ${{ steps.tf_output.outputs.alb_dns_name }}
-          ECR_URL:  ${{ steps.tf_output.outputs.ecr_repository_url }}
-          EC2_IP:   ${{ steps.tf_output.outputs.ec2_public_ip }}
+          GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
+          REPO:      ${{ github.repository }}
+          ALB_DNS:   ${{ steps.tf_output.outputs.alb_dns_name }}
+          ECR_URL:   ${{ steps.tf_output.outputs.ecr_repository_url }}
+          EC2_IP:    ${{ steps.tf_output.outputs.ec2_public_ip }}
+          ROLE_ARN:  ${{ steps.tf_output.outputs.aws_role_arn }}
+          PRIVKEY:   ${{ steps.privkey.outputs.pem }}
         run: |
+          API="https://api.github.com"
+          AUTH=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
+
+          ###########################################################################
+          # Helper: upsert a repository variable (PATCH existing, POST new)
+          ###########################################################################
           set_var() {
             local name="$1"
             local value="$2"
-            # Try PATCH (update) first, fall back to POST (create)
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-              -X PATCH \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/$REPO/actions/variables/$name" \
+            HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+              -X PATCH "${AUTH[@]}" \
+              "$API/repos/$REPO/actions/variables/$name" \
               -d "{\"name\":\"$name\",\"value\":\"$value\"}")
-            if [ "$STATUS" != "204" ]; then
-              curl -s -X POST \
-                -H "Authorization: Bearer $GH_TOKEN" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/$REPO/actions/variables" \
+            if [ "$HTTP" != "204" ]; then
+              curl -sf -X POST "${AUTH[@]}" \
+                "$API/repos/$REPO/actions/variables" \
                 -d "{\"name\":\"$name\",\"value\":\"$value\"}"
+              echo "Created variable $name"
+            else
+              echo "Updated variable $name"
             fi
           }
-          set_var "TF_OUT_ALB_DNS_NAME"       "$ALB_DNS"
-          set_var "TF_OUT_ECR_REPOSITORY_URL" "$ECR_URL"
-          set_var "TF_OUT_EC2_PUBLIC_IP"       "$EC2_IP"
-          echo "Repository variables updated."
+
+          ###########################################################################
+          # Helper: upsert a repository secret (requires libsodium / gh CLI)
+          # gh secret set handles the encryption automatically.
+          ###########################################################################
+          set_secret() {
+            local name="$1"
+            local value="$2"
+            printf '%s' "$value" | gh secret set "$name" \
+              --repo "$REPO" \
+              --body -
+            echo "Set secret $name"
+          }
+
+          # Install GitHub CLI if not present (ubuntu-latest already has it)
+          which gh || (apt-get update -qq && apt-get install -y -qq gh)
+
+          # Set the four repository variables
+          set_var "AWS_ROLE_ARN"               "$ROLE_ARN"
+          set_var "TF_OUT_ECR_REPOSITORY_URL"  "$ECR_URL"
+          set_var "TF_OUT_EC2_PUBLIC_IP"        "$EC2_IP"
+          set_var "TF_OUT_ALB_DNS_NAME"         "$ALB_DNS"
+
+          # Set the SSH private key as a repository secret
+          set_secret "EC2_SSH_KEY" "$PRIVKEY"
+
+          echo "All repository variables and EC2_SSH_KEY secret have been set."
 
   # ---------------------------------------------------------------------------
-  # Notify on failure
   notify-failure:
     name: "Notify on failure"
     needs: terraform
@@ -235,6 +289,6 @@ jobs:
     steps:
       - name: Annotate failure
         run: |
-          echo "::error::Terraform infra workflow failed. Check the logs above for details."
+          echo "::error::Terraform infra workflow failed. Check the logs above."
           echo "## ❌ Infra workflow failed" >> "$GITHUB_STEP_SUMMARY"
           echo "Check the job logs for details." >> "$GITHUB_STEP_SUMMARY"

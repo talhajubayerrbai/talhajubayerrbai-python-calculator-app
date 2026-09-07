@@ -26,8 +26,8 @@ variable "instance_type" {
   default     = "t3.medium"
 }
 
-variable "ssh_key_name" {
-  description = "Name of an existing EC2 key pair to allow SSH access. Leave empty to skip key attachment."
+variable "github_repo" {
+  description = "GitHub repository in <owner>/<repo> format. Used to scope the OIDC trust policy to this repo only."
   type        = string
-  default     = ""
+  default     = "talhajubayerrbai/talhajubayerrbai-python-calculator-app"
 }

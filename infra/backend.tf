@@ -1,11 +1,10 @@
 ###############################################################################
-# backend.tf — remote state in S3 + DynamoDB locking
+# backend.tf — remote state in S3 + DynamoDB locking; provider requirements
 #
 # The S3 bucket and DynamoDB table must exist BEFORE running `terraform init`.
-# Bootstrap once manually or via the bootstrap script in this directory.
-#
-# Bucket : udap-calculator-tf-state-a7f3k9   (us-east-1, versioning enabled)
-# Table  : udap-calculator-tf-lock           (PAY_PER_REQUEST, LockID PK)
+# They were bootstrapped in Session 1:
+#   Bucket : udap-calculator-tf-state-a7f3k9   (us-east-1, versioning enabled)
+#   Table  : udap-calculator-tf-lock           (PAY_PER_REQUEST, LockID PK)
 ###############################################################################
 
 terraform {
@@ -15,6 +14,10 @@ terraform {
     aws = {
       source  = "hashicorp/aws"
       version = "~> 5.0"
+    }
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
     }
     random = {
       source  = "hashicorp/random"
@@ -36,9 +39,11 @@ provider "aws" {
 
   default_tags {
     tags = {
-      Project     = "calculator"
-      ManagedBy   = "terraform"
-      Repository  = "talhajubayerrbai/python-calculator-app"
+      Project    = "calculator"
+      ManagedBy  = "terraform"
+      Repository = "talhajubayerrbai/talhajubayerrbai-python-calculator-app"
     }
   }
 }
+
+provider "tls" {}

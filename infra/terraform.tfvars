@@ -7,7 +7,4 @@ aws_region    = "us-east-1"
 project       = "calculator"
 environment   = "dev"
 instance_type = "t3.medium"
-
-# ssh_key_name — set to an existing EC2 key pair name to enable SSH,
-# or leave empty to rely on SSM Session Manager only.
-ssh_key_name = ""
+github_repo   = "talhajubayerrbai/talhajubayerrbai-python-calculator-app"
