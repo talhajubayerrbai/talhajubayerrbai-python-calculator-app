@@ -1,0 +1,12 @@
+apiVersion: v2
+name: calculator
+description: Python Flask Calculator App — Helm chart
+type: application
+version: 0.1.0
+appVersion: "latest"
+keywords:
+  - calculator
+  - flask
+  - python
+maintainers:
+  - name: platform-team

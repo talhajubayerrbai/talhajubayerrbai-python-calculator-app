@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Python Calculator</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      color: #e0e0e0;
+    }
+
+    .card {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 16px;
+      padding: 2.5rem 2rem;
+      width: 100%;
+      max-width: 420px;
+      backdrop-filter: blur(12px);
+      box-shadow: 0 24px 64px rgba(0, 0, 0, 0.5);
+    }
+
+    h1 {
+      text-align: center;
+      font-size: 1.6rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      margin-bottom: 2rem;
+      color: #e2e8f0;
+    }
+
+    h1 span { color: #63b3ed; }
+
+    label {
+      display: block;
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #94a3b8;
+      margin-bottom: 0.4rem;
+      margin-top: 1.2rem;
+    }
+
+    input[type="number"] {
+      width: 100%;
+      padding: 0.65rem 0.9rem;
+      background: rgba(255, 255, 255, 0.07);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: 8px;
+      color: #e2e8f0;
+      font-size: 1rem;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    input[type="number"]:focus {
+      border-color: #63b3ed;
+    }
+
+    /* hide browser spinner arrows */
+    input[type="number"]::-webkit-inner-spin-button,
+    input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; }
+    input[type="number"] { -moz-appearance: textfield; }
+
+    .ops {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 0.5rem;
+      margin-top: 1.4rem;
+    }
+
+    .op-btn {
+      padding: 0.7rem 0;
+      background: rgba(99, 179, 237, 0.12);
+      border: 1px solid rgba(99, 179, 237, 0.25);
+      border-radius: 8px;
+      color: #93c5fd;
+      font-size: 1.2rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s, transform 0.1s;
+    }
+
+    .op-btn:hover   { background: rgba(99, 179, 237, 0.25); }
+    .op-btn.active  { background: #2563eb; border-color: #3b82f6; color: #fff; }
+    .op-btn:active  { transform: scale(0.95); }
+
+    .calculate-btn {
+      width: 100%;
+      margin-top: 1.6rem;
+      padding: 0.85rem;
+      background: #2563eb;
+      border: none;
+      border-radius: 10px;
+      color: #fff;
+      font-size: 1rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      cursor: pointer;
+      transition: background 0.2s, transform 0.1s;
+    }
+
+    .calculate-btn:hover  { background: #1d4ed8; }
+    .calculate-btn:active { transform: scale(0.98); }
+
+    .result-box {
+      margin-top: 1.5rem;
+      min-height: 3.2rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 10px;
+      font-size: 1.5rem;
+      font-weight: 700;
+      color: #63b3ed;
+      transition: color 0.2s;
+    }
+
+    .result-box.error { color: #f87171; font-size: 0.95rem; font-weight: 500; }
+    .result-box.empty { color: #475569; font-size: 0.9rem; font-weight: 400; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>🧮 <span>Calculator</span></h1>
+
+    <label for="numA">Number A</label>
+    <input type="number" id="numA" placeholder="e.g. 42" step="any" />
+
+    <label for="numB">Number B</label>
+    <input type="number" id="numB" placeholder="e.g. 7" step="any" />
+
+    <label>Operation</label>
+    <div class="ops">
+      <button class="op-btn active" data-op="add"      title="Add">+</button>
+      <button class="op-btn"        data-op="subtract"  title="Subtract">−</button>
+      <button class="op-btn"        data-op="multiply"  title="Multiply">×</button>
+      <button class="op-btn"        data-op="divide"    title="Divide">÷</button>
+    </div>
+
+    <button class="calculate-btn" id="calcBtn">Calculate</button>
+
+    <div class="result-box empty" id="resultBox">Enter numbers and press Calculate</div>
+  </div>
+
+  <script>
+    const opBtns  = document.querySelectorAll('.op-btn');
+    const calcBtn = document.getElementById('calcBtn');
+    const resultBox = document.getElementById('resultBox');
+    let selectedOp = 'add';
+
+    opBtns.forEach(btn => {
+      btn.addEventListener('click', () => {
+        opBtns.forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        selectedOp = btn.dataset.op;
+      });
+    });
+
+    calcBtn.addEventListener('click', async () => {
+      const a = document.getElementById('numA').value.trim();
+      const b = document.getElementById('numB').value.trim();
+
+      if (a === '' || b === '') {
+        setResult('Please enter both numbers.', 'error');
+        return;
+      }
+
+      calcBtn.disabled = true;
+      calcBtn.textContent = 'Calculating…';
+
+      try {
+        const res = await fetch('/calculate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ a: parseFloat(a), b: parseFloat(b), op: selectedOp })
+        });
+
+        const data = await res.json();
+
+        if (!res.ok) {
+          setResult(data.error || 'Unknown error', 'error');
+        } else {
+          setResult('= ' + data.result, 'ok');
+        }
+      } catch (err) {
+        setResult('Network error — is the server running?', 'error');
+      } finally {
+        calcBtn.disabled = false;
+        calcBtn.textContent = 'Calculate';
+      }
+    });
+
+    function setResult(text, kind) {
+      resultBox.textContent = text;
+      resultBox.className = 'result-box ' + (kind === 'error' ? 'error' : '');
+    }
+
+    // Allow Enter key to trigger calculation
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Enter') calcBtn.click();
+    });
+  </script>
+</body>
+</html>

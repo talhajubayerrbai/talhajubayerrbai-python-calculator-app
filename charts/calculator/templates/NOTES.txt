@@ -1,0 +1,33 @@
+Thank you for installing {{ .Chart.Name }} {{ .Chart.Version }}!
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Python Flask Calculator — Quick Start
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. The calculator UI is reachable via the ALB DNS name provisioned by Terraform:
+
+     http://<ALB_DNS_NAME>/
+
+   ALB forwards port 80 → EC2 node port 30080 → this Service → pod port 5000.
+
+2. To reach the app directly on the node (e.g. for smoke-testing):
+
+     NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="ExternalIP")].address}')
+     curl http://$NODE_IP:{{ .Values.service.nodePort }}/health
+
+   Expected response: {"status": "ok"}
+
+3. To upgrade the image tag after a new ECR push:
+
+     helm upgrade {{ .Release.Name }} ./charts/calculator \
+       --set image.repository=<ECR_URL> \
+       --set image.tag=<GIT_SHA_OR_TAG>
+
+4. To uninstall:
+
+     helm uninstall {{ .Release.Name }}
+
+Chart version:   {{ .Chart.Version }}
+App version:     {{ .Chart.AppVersion }}
+Release name:    {{ .Release.Name }}
+Namespace:       {{ .Release.Namespace }}

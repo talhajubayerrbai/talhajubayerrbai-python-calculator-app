@@ -1,0 +1,177 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CI workflow: Python Calculator App
+#
+# Triggers on push to main when app code, Dockerfile, or Helm chart changes.
+# Two jobs:
+#   build        — install deps, lint imports, run pytest (or smoke test)
+#   docker-build — build the Docker image, start it, verify /health, stop it
+#
+# NOTE: No ECR push here — that belongs in the deploy workflow (Session 3).
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: App CI
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "app/**"
+      - "Dockerfile"
+      - "charts/**"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "app/**"
+      - "Dockerfile"
+      - "charts/**"
+
+env:
+  PYTHON_VERSION: "3.11"
+  IMAGE_NAME: calculator-app
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 1: build — Python install + test
+  # ───────────────────────────────────────────────────────────────────────────
+  build:
+    name: Build & Test (Python ${{ env.PYTHON_VERSION }})
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: app/requirements.txt
+
+      - name: Install application dependencies
+        run: pip install -r app/requirements.txt
+
+      - name: Install pytest (test runner)
+        run: pip install pytest
+
+      - name: Run tests (pytest) or smoke-test if no tests present
+        run: |
+          if [ -d "app/tests" ] && find app/tests -name "test_*.py" | grep -q .; then
+            echo "▶ Running pytest suite"
+            python -m pytest app/tests/ -v --tb=short
+          else
+            echo "▶ No tests found — running import smoke test"
+            cd app && python -c "import app; print('Smoke test passed: Flask app imported successfully')"
+          fi
+
+      - name: Verify /health endpoint logic (unit-level, no server needed)
+        run: |
+          cd app
+          python -c "
+          from app import app
+          with app.test_client() as c:
+              r = c.get('/health')
+              assert r.status_code == 200, f'Expected 200, got {r.status_code}'
+              import json
+              body = json.loads(r.data)
+              assert body == {'status': 'ok'}, f'Unexpected body: {body}'
+          print('Health endpoint logic verified.')
+          "
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 2: docker-build — build image, run it, curl /health, stop
+  # ───────────────────────────────────────────────────────────────────────────
+  docker-build:
+    name: Docker Build & Health Check
+    runs-on: ubuntu-latest
+    # Run in parallel with build; both must pass for the workflow to succeed
+    needs: []
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --tag ${{ env.IMAGE_NAME }}:ci-${{ github.sha }} \
+            --file Dockerfile \
+            .
+
+      - name: Start container in background
+        id: start_container
+        run: |
+          CONTAINER_ID=$(docker run \
+            --rm \
+            --detach \
+            --publish 5000:5000 \
+            --name calculator-ci \
+            ${{ env.IMAGE_NAME }}:ci-${{ github.sha }})
+          echo "container_id=$CONTAINER_ID" >> "$GITHUB_OUTPUT"
+          echo "Started container: $CONTAINER_ID"
+
+      - name: Wait for app to become ready (up to 30 s)
+        run: |
+          echo "Waiting for Flask/gunicorn to be ready..."
+          for i in $(seq 1 30); do
+            if curl --silent --fail http://localhost:5000/health > /dev/null 2>&1; then
+              echo "App is ready after ${i}s"
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "ERROR: app did not become ready within 30 seconds"
+              docker logs calculator-ci || true
+              exit 1
+            fi
+            sleep 1
+          done
+
+      - name: Verify GET /health returns {"status":"ok"}
+        run: |
+          RESPONSE=$(curl --silent --fail http://localhost:5000/health)
+          echo "Response: $RESPONSE"
+          echo "$RESPONSE" | python3 -c "
+          import sys, json
+          body = json.load(sys.stdin)
+          assert body == {'status': 'ok'}, f'Unexpected: {body}'
+          print('✓ /health returned {\"status\": \"ok\"}')"
+
+      - name: Verify POST /calculate — basic smoke
+        run: |
+          RESPONSE=$(curl --silent --fail \
+            --request POST \
+            --header 'Content-Type: application/json' \
+            --data '{"a": 6, "b": 7, "op": "multiply"}' \
+            http://localhost:5000/calculate)
+          echo "Response: $RESPONSE"
+          echo "$RESPONSE" | python3 -c "
+          import sys, json
+          body = json.load(sys.stdin)
+          assert body.get('result') == 42, f'Expected 42, got: {body}'
+          print('✓ POST /calculate 6×7 = 42')"
+
+      - name: Verify GET / returns HTML UI
+        run: |
+          STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' http://localhost:5000/)
+          echo "GET / HTTP status: $STATUS"
+          [ "$STATUS" -eq 200 ] || (echo "ERROR: / returned $STATUS" && exit 1)
+          echo "✓ GET / returned 200"
+
+      - name: Stop container
+        if: always()
+        run: docker stop calculator-ci || true
+
+      - name: Image summary
+        if: success()
+        run: |
+          echo "### Docker image built successfully" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Property | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|----------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Image | \`${{ env.IMAGE_NAME }}:ci-${{ github.sha }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| /health | ✅ 200 {\"status\":\"ok\"} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| POST /calculate | ✅ 6×7=42 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| GET / | ✅ 200 HTML UI |" >> "$GITHUB_STEP_SUMMARY"
+          docker image ls ${{ env.IMAGE_NAME }}:ci-${{ github.sha }}

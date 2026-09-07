@@ -1,0 +1,61 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Default values for the calculator Helm chart.
+# Override with:  helm upgrade --install calculator ./charts/calculator \
+#                   --set image.repository=<ECR_URL> \
+#                   --set image.tag=<GIT_SHA>
+# ─────────────────────────────────────────────────────────────────────────────
+
+replicaCount: 1
+
+image:
+  # Replace with your ECR repository URL before deploying, e.g.:
+  # 123456789012.dkr.ecr.us-east-1.amazonaws.com/calculator-app
+  repository: REPLACE_WITH_ECR_URL
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+service:
+  type: NodePort
+  # Container port (Flask / gunicorn listens here)
+  port: 5000
+  # Node port exposed on the EC2 instance — ALB target group points here
+  nodePort: 30080
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 5000
+  initialDelaySeconds: 15
+  periodSeconds: 20
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 5000
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+# Pod-level labels merged onto the selector — keep stable across upgrades
+podLabels: {}
+
+# Extra environment variables injected into the container
+extraEnv: []
+# - name: MY_VAR
+#   value: "my-value"
+
+# Node selector, tolerations, affinity (empty = any node)
+nodeSelector: {}
+tolerations: []
+affinity: {}
