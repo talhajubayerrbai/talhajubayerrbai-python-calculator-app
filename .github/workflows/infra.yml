@@ -1,23 +1,5 @@
 ###############################################################################
 # infra.yml — Terraform plan + apply for the calculator-app AWS infrastructure
-#
-# Authentication: static AWS IAM credentials (AWS_ACCESS_KEY_ID /
-# AWS_SECRET_ACCESS_KEY) stored as repository secrets via set_pipeline_account.
-#
-# State backend: S3 bucket passed via TF_STATE_BUCKET (secret) and
-# TF_STATE_KEY / AWS_REGION (variables) written by set_pipeline_account.
-#
-# After a successful apply the workflow writes four GitHub repository variables
-# and one repository secret that the deploy workflow consumes:
-#
-#   Variables:
-#     TF_OUT_ECR_REPOSITORY_URL  — ECR repository URL
-#     TF_OUT_EC2_PUBLIC_IP       — EC2 instance public IP
-#     TF_OUT_ALB_DNS_NAME        — ALB DNS name
-#     AWS_ROLE_ARN               — IAM role ARN for OIDC (future use)
-#
-#   Secret:
-#     EC2_SSH_KEY                — PEM private key for SSH access
 ###############################################################################
 
 name: "Infra — Terraform Plan & Apply"
@@ -67,6 +49,7 @@ jobs:
     defaults:
       run:
         working-directory: ${{ env.WORKING_DIR }}
+        shell: bash
 
     outputs:
       ec2_public_ip:      ${{ steps.tf_output.outputs.ec2_public_ip }}
@@ -75,13 +58,11 @@ jobs:
       aws_role_arn:       ${{ steps.tf_output.outputs.aws_role_arn }}
 
     steps:
-      # -----------------------------------------------------------------------
       - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.revision || github.sha }}
 
-      # -----------------------------------------------------------------------
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -89,23 +70,25 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ vars.AWS_REGION }}
 
-      # -----------------------------------------------------------------------
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
 
-      # -----------------------------------------------------------------------
       - name: Terraform Format Check
         id: fmt
         run: terraform fmt -check -recursive
         continue-on-error: true
 
-      # -----------------------------------------------------------------------
       - name: Terraform Init
         id: init
         run: |
+          set -euo pipefail
+          echo "=== terraform init ==="
+          echo "Bucket: ${{ secrets.TF_STATE_BUCKET != '' && 'SET' || 'EMPTY' }}"
+          echo "Key:    ${{ vars.TF_STATE_KEY }}"
+          echo "Region: ${{ vars.AWS_REGION }}"
           terraform init \
             -input=false \
             -reconfigure \
@@ -113,29 +96,41 @@ jobs:
             -backend-config="key=${{ vars.TF_STATE_KEY }}" \
             -backend-config="region=${{ vars.AWS_REGION }}" \
             -backend-config="encrypt=true"
+          echo "=== init complete ==="
         env:
           AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_REGION:            ${{ vars.AWS_REGION }}
 
-      # -----------------------------------------------------------------------
       - name: Terraform Validate
         id: validate
-        run: terraform validate -no-color
+        run: |
+          set -euo pipefail
+          echo "=== terraform validate ==="
+          terraform validate -no-color
+          echo "=== validate complete ==="
 
-      # -----------------------------------------------------------------------
       - name: Terraform Plan
         id: plan
         run: |
+          set -euo pipefail
+          echo "=== terraform plan ==="
           terraform plan \
             -no-color \
             -input=false \
             -out=tfplan \
-            2>&1 | tee plan_output.txt
+            -detailed-exitcode 2>&1 | tee plan_output.txt
+          PLAN_EXIT=${PIPESTATUS[0]}
+          echo "Plan exit code: $PLAN_EXIT"
+          # 0 = no changes, 2 = changes present, 1 = error
+          if [ "$PLAN_EXIT" = "1" ]; then
+            echo "::error::terraform plan failed"
+            exit 1
+          fi
+          echo "=== plan complete (exit $PLAN_EXIT) ==="
         env:
           TF_VAR_aws_region: ${{ vars.AWS_REGION }}
 
-      # -----------------------------------------------------------------------
       - name: Comment plan on PR
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
@@ -156,26 +151,28 @@ jobs:
               body,
             });
 
-      # -----------------------------------------------------------------------
       - name: Terraform Apply
         id: apply
         if: |
           (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
           (github.event_name == 'workflow_dispatch' && inputs.action == 'apply')
         run: |
+          set -euo pipefail
+          echo "=== terraform apply ==="
           terraform apply \
             -no-color \
             -input=false \
             -auto-approve \
             tfplan
+          echo "=== apply complete ==="
         env:
           TF_VAR_aws_region: ${{ vars.AWS_REGION }}
 
-      # -----------------------------------------------------------------------
       - name: Terraform Destroy
         id: destroy
         if: github.event_name == 'workflow_dispatch' && inputs.action == 'destroy'
         run: |
+          set -euo pipefail
           terraform destroy \
             -no-color \
             -input=false \
@@ -183,11 +180,11 @@ jobs:
         env:
           TF_VAR_aws_region: ${{ vars.AWS_REGION }}
 
-      # -----------------------------------------------------------------------
       - name: Capture Terraform outputs
         id: tf_output
         if: steps.apply.outcome == 'success'
         run: |
+          set -euo pipefail
           EC2_IP=$(terraform output -raw ec2_public_ip         2>/dev/null || echo "")
           ALB_DNS=$(terraform output -raw alb_dns_name         2>/dev/null || echo "")
           ECR_URL=$(terraform output -raw ecr_repository_url   2>/dev/null || echo "")
@@ -198,20 +195,16 @@ jobs:
           echo "ecr_repository_url=$ECR_URL" >> "$GITHUB_OUTPUT"
           echo "aws_role_arn=$ROLE_ARN"      >> "$GITHUB_OUTPUT"
 
-          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
-          ## Infrastructure Outputs
-          | Output | Value |
-          |--------|-------|
-          | ec2_public_ip | \`$EC2_IP\` |
-          | alb_dns_name | \`$ALB_DNS\` |
-          | ecr_repository_url | \`$ECR_URL\` |
-          | aws_role_arn | \`$ROLE_ARN\` |
-          EOF
+          echo "## Infrastructure Outputs" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Output | Value |"         >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|-------|"         >> "$GITHUB_STEP_SUMMARY"
+          echo "| ec2_public_ip | \`$EC2_IP\` |"  >> "$GITHUB_STEP_SUMMARY"
+          echo "| alb_dns_name | \`$ALB_DNS\` |"  >> "$GITHUB_STEP_SUMMARY"
+          echo "| ecr_repository_url | \`$ECR_URL\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| aws_role_arn | \`$ROLE_ARN\` |"  >> "$GITHUB_STEP_SUMMARY"
 
-          # Emit the live URL for UDAP placement tracking
           echo "Live URL: http://$EC2_IP"
 
-      # -----------------------------------------------------------------------
       - name: Retrieve private key
         id: privkey
         if: steps.apply.outcome == 'success'
@@ -222,7 +215,6 @@ jobs:
           echo "$PRIVKEY"   >> "$GITHUB_OUTPUT"
           echo "KEYEOF"     >> "$GITHUB_OUTPUT"
 
-      # -----------------------------------------------------------------------
       - name: Set repository variables and EC2_SSH_KEY secret
         if: steps.apply.outcome == 'success'
         env:
@@ -254,25 +246,19 @@ jobs:
             fi
           }
 
-          set_secret() {
-            local name="$1"
-            local value="$2"
-            printf '%s' "$value" | gh secret set "$name" \
-              --repo "$REPO" \
-              --body -
-            echo "Set secret $name"
-          }
-
           which gh || (apt-get update -qq && apt-get install -y -qq gh)
+
+          printf '%s' "$PRIVKEY" | gh secret set "EC2_SSH_KEY" \
+            --repo "$REPO" \
+            --body -
+          echo "Set secret EC2_SSH_KEY"
 
           set_var "AWS_ROLE_ARN"               "$ROLE_ARN"
           set_var "TF_OUT_ECR_REPOSITORY_URL"  "$ECR_URL"
           set_var "TF_OUT_EC2_PUBLIC_IP"        "$EC2_IP"
           set_var "TF_OUT_ALB_DNS_NAME"         "$ALB_DNS"
 
-          set_secret "EC2_SSH_KEY" "$PRIVKEY"
-
-          echo "All repository variables and EC2_SSH_KEY secret have been set."
+          echo "All variables and EC2_SSH_KEY set."
 
   notify-failure:
     name: "Notify on failure"
@@ -284,4 +270,3 @@ jobs:
         run: |
           echo "::error::Terraform infra workflow failed. Check the logs above."
           echo "## Infra workflow failed" >> "$GITHUB_STEP_SUMMARY"
-          echo "Check the job logs for details." >> "$GITHUB_STEP_SUMMARY"
