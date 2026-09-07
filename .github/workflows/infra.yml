@@ -1,5 +1,7 @@
 ###############################################################################
 # infra.yml — Terraform plan + apply for the calculator-app AWS infrastructure
+# Fix: sanitize non-ASCII characters (em-dash, en-dash, smart quotes) in .tf
+# files before running Terraform, since AWS rejects them in resource descriptions
 ###############################################################################
 
 name: "Infra — Terraform Plan & Apply"
@@ -49,7 +51,7 @@ jobs:
     defaults:
       run:
         working-directory: ${{ env.WORKING_DIR }}
-        shell: bash
+        shell: bash -euo pipefail {0}
 
     outputs:
       ec2_public_ip:      ${{ steps.tf_output.outputs.ec2_public_ip }}
@@ -76,6 +78,70 @@ jobs:
           terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
 
+      - name: Sanitize non-ASCII characters in Terraform files
+        working-directory: ${{ env.WORKING_DIR }}
+        shell: bash
+        run: |
+          echo "Scanning for non-ASCII characters in .tf files..."
+          # Show any files with non-ASCII chars
+          grep -rlP '[^\x00-\x7F]' . --include='*.tf' || echo "No non-ASCII found by grep"
+
+          # Replace common non-ASCII punctuation with ASCII equivalents in all .tf files
+          # em dash (U+2014) -> hyphen
+          # en dash (U+2013) -> hyphen
+          # left/right double quotes (U+201C/U+201D) -> "
+          # left/right single quotes (U+2018/U+2019) -> '
+          # horizontal ellipsis (U+2026) -> ...
+          # Any remaining non-ASCII -> removed
+          python3 - <<'PYEOF'
+          import os, re
+
+          replacements = [
+              ('\u2014', '-'),   # em dash
+              ('\u2013', '-'),   # en dash
+              ('\u2012', '-'),   # figure dash
+              ('\u2011', '-'),   # non-breaking hyphen
+              ('\u2010', '-'),   # hyphen
+              ('\u201c', '"'),   # left double quote
+              ('\u201d', '"'),   # right double quote
+              ('\u2018', "'"),   # left single quote
+              ('\u2019', "'"),   # right single quote
+              ('\u2026', '...'), # horizontal ellipsis
+              ('\u00a0', ' '),   # non-breaking space
+          ]
+
+          tf_dir = '.'
+          fixed = 0
+          for fname in os.listdir(tf_dir):
+              if not fname.endswith('.tf'):
+                  continue
+              path = os.path.join(tf_dir, fname)
+              with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                  content = f.read()
+              original = content
+              for bad, good in replacements:
+                  content = content.replace(bad, good)
+              # Strip any remaining non-ASCII characters
+              content = content.encode('ascii', 'replace').decode('ascii').replace('?', '-')
+              # But only replace actual non-ASCII, not question marks already in content
+              # So re-read original and do a more careful replacement
+              with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                  content2 = f.read()
+              for bad, good in replacements:
+                  content2 = content2.replace(bad, good)
+              # Now encode to ascii, replacing unknown chars with nothing
+              content2 = ''.join(c if ord(c) < 128 else '-' for c in content2)
+              if content2 != original:
+                  with open(path, 'w', encoding='utf-8') as f:
+                      f.write(content2)
+                  print(f"Fixed: {path}")
+                  fixed += 1
+              else:
+                  print(f"Clean: {path}")
+          print(f"Total files fixed: {fixed}")
+          PYEOF
+          echo "Sanitization complete"
+
       - name: Terraform Format Check
         id: fmt
         run: terraform fmt -check -recursive
@@ -84,11 +150,10 @@ jobs:
       - name: Terraform Init
         id: init
         run: |
-          set -euo pipefail
-          echo "=== terraform init ==="
-          echo "Bucket: ${{ secrets.TF_STATE_BUCKET != '' && 'SET' || 'EMPTY' }}"
-          echo "Key:    ${{ vars.TF_STATE_KEY }}"
-          echo "Region: ${{ vars.AWS_REGION }}"
+          echo "STEP: terraform init"
+          echo "Bucket secret set: ${{ secrets.TF_STATE_BUCKET != '' && 'YES' || 'NO - EMPTY' }}"
+          echo "Key var: ${{ vars.TF_STATE_KEY }}"
+          echo "Region var: ${{ vars.AWS_REGION }}"
           terraform init \
             -input=false \
             -reconfigure \
@@ -96,7 +161,7 @@ jobs:
             -backend-config="key=${{ vars.TF_STATE_KEY }}" \
             -backend-config="region=${{ vars.AWS_REGION }}" \
             -backend-config="encrypt=true"
-          echo "=== init complete ==="
+          echo "STEP: init SUCCESS"
         env:
           AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -105,29 +170,21 @@ jobs:
       - name: Terraform Validate
         id: validate
         run: |
-          set -euo pipefail
-          echo "=== terraform validate ==="
+          echo "STEP: terraform validate"
           terraform validate -no-color
-          echo "=== validate complete ==="
+          echo "STEP: validate SUCCESS"
 
       - name: Terraform Plan
         id: plan
         run: |
-          set -euo pipefail
-          echo "=== terraform plan ==="
+          echo "STEP: terraform plan"
+          set -o pipefail
           terraform plan \
             -no-color \
             -input=false \
             -out=tfplan \
-            -detailed-exitcode 2>&1 | tee plan_output.txt
-          PLAN_EXIT=${PIPESTATUS[0]}
-          echo "Plan exit code: $PLAN_EXIT"
-          # 0 = no changes, 2 = changes present, 1 = error
-          if [ "$PLAN_EXIT" = "1" ]; then
-            echo "::error::terraform plan failed"
-            exit 1
-          fi
-          echo "=== plan complete (exit $PLAN_EXIT) ==="
+            2>&1 | tee plan_output.txt
+          echo "STEP: plan SUCCESS"
         env:
           TF_VAR_aws_region: ${{ vars.AWS_REGION }}
 
@@ -140,15 +197,12 @@ jobs:
             const fs = require('fs');
             const plan = fs.readFileSync('${{ env.WORKING_DIR }}/plan_output.txt', 'utf8');
             const maxLen = 60000;
-            const truncated = plan.length > maxLen
-              ? plan.substring(0, maxLen) + '\n\n... [truncated]'
-              : plan;
-            const body = `## Terraform Plan\n\`\`\`hcl\n${truncated}\n\`\`\``;
+            const truncated = plan.length > maxLen ? plan.substring(0, maxLen) + '\n\n... [truncated]' : plan;
             github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body,
+              body: `## Terraform Plan\n\`\`\`hcl\n${truncated}\n\`\`\``,
             });
 
       - name: Terraform Apply
@@ -157,14 +211,13 @@ jobs:
           (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
           (github.event_name == 'workflow_dispatch' && inputs.action == 'apply')
         run: |
-          set -euo pipefail
-          echo "=== terraform apply ==="
+          echo "STEP: terraform apply"
           terraform apply \
             -no-color \
             -input=false \
             -auto-approve \
             tfplan
-          echo "=== apply complete ==="
+          echo "STEP: apply SUCCESS"
         env:
           TF_VAR_aws_region: ${{ vars.AWS_REGION }}
 
@@ -172,7 +225,6 @@ jobs:
         id: destroy
         if: github.event_name == 'workflow_dispatch' && inputs.action == 'destroy'
         run: |
-          set -euo pipefail
           terraform destroy \
             -no-color \
             -input=false \
@@ -184,7 +236,7 @@ jobs:
         id: tf_output
         if: steps.apply.outcome == 'success'
         run: |
-          set -euo pipefail
+          echo "STEP: capture outputs"
           EC2_IP=$(terraform output -raw ec2_public_ip         2>/dev/null || echo "")
           ALB_DNS=$(terraform output -raw alb_dns_name         2>/dev/null || echo "")
           ECR_URL=$(terraform output -raw ecr_repository_url   2>/dev/null || echo "")
@@ -196,14 +248,11 @@ jobs:
           echo "aws_role_arn=$ROLE_ARN"      >> "$GITHUB_OUTPUT"
 
           echo "## Infrastructure Outputs" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Output | Value |"         >> "$GITHUB_STEP_SUMMARY"
-          echo "|--------|-------|"         >> "$GITHUB_STEP_SUMMARY"
-          echo "| ec2_public_ip | \`$EC2_IP\` |"  >> "$GITHUB_STEP_SUMMARY"
-          echo "| alb_dns_name | \`$ALB_DNS\` |"  >> "$GITHUB_STEP_SUMMARY"
-          echo "| ecr_repository_url | \`$ECR_URL\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| aws_role_arn | \`$ROLE_ARN\` |"  >> "$GITHUB_STEP_SUMMARY"
+          printf "| Output | Value |\n|--------|-------|\n| ec2_public_ip | \`%s\` |\n| alb_dns_name | \`%s\` |\n| ecr_repository_url | \`%s\` |\n| aws_role_arn | \`%s\` |\n" \
+            "$EC2_IP" "$ALB_DNS" "$ECR_URL" "$ROLE_ARN" >> "$GITHUB_STEP_SUMMARY"
 
           echo "Live URL: http://$EC2_IP"
+          echo "STEP: capture outputs DONE -- EC2_IP=$EC2_IP ALB=$ALB_DNS"
 
       - name: Retrieve private key
         id: privkey
@@ -211,9 +260,7 @@ jobs:
         run: |
           PRIVKEY=$(terraform output -raw ec2_private_key_pem 2>/dev/null || echo "")
           echo "::add-mask::$PRIVKEY"
-          echo "pem<<KEYEOF" >> "$GITHUB_OUTPUT"
-          echo "$PRIVKEY"   >> "$GITHUB_OUTPUT"
-          echo "KEYEOF"     >> "$GITHUB_OUTPUT"
+          printf 'pem<<KEYEOF\n%s\nKEYEOF\n' "$PRIVKEY" >> "$GITHUB_OUTPUT"
 
       - name: Set repository variables and EC2_SSH_KEY secret
         if: steps.apply.outcome == 'success'
@@ -230,8 +277,7 @@ jobs:
           AUTH=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
 
           set_var() {
-            local name="$1"
-            local value="$2"
+            local name="$1" value="$2"
             HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
               -X PATCH "${AUTH[@]}" \
               "$API/repos/$REPO/actions/variables/$name" \
@@ -248,16 +294,13 @@ jobs:
 
           which gh || (apt-get update -qq && apt-get install -y -qq gh)
 
-          printf '%s' "$PRIVKEY" | gh secret set "EC2_SSH_KEY" \
-            --repo "$REPO" \
-            --body -
+          printf '%s' "$PRIVKEY" | gh secret set "EC2_SSH_KEY" --repo "$REPO" --body -
           echo "Set secret EC2_SSH_KEY"
 
           set_var "AWS_ROLE_ARN"               "$ROLE_ARN"
           set_var "TF_OUT_ECR_REPOSITORY_URL"  "$ECR_URL"
           set_var "TF_OUT_EC2_PUBLIC_IP"        "$EC2_IP"
           set_var "TF_OUT_ALB_DNS_NAME"         "$ALB_DNS"
-
           echo "All variables and EC2_SSH_KEY set."
 
   notify-failure:
@@ -270,3 +313,4 @@ jobs:
         run: |
           echo "::error::Terraform infra workflow failed. Check the logs above."
           echo "## Infra workflow failed" >> "$GITHUB_STEP_SUMMARY"
+          echo "Check the job logs for details." >> "$GITHUB_STEP_SUMMARY"
