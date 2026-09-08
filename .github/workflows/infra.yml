@@ -1,6 +1,5 @@
 ###############################################################################
 # infra.yml — Terraform plan + apply for the calculator-app AWS infrastructure
-# Fix: hardcode S3 bucket/key/region to bypass secret issues; verbose logging
 ###############################################################################
 
 name: "Infra — Terraform Plan & Apply"
@@ -72,6 +71,7 @@ jobs:
         with:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region:            us-east-1
 
       - name: Verify AWS identity
@@ -143,6 +143,7 @@ jobs:
         env:
           AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_SESSION_TOKEN:     ${{ secrets.AWS_SESSION_TOKEN }}
           AWS_REGION:            us-east-1
 
       - name: Terraform Validate
@@ -169,7 +170,10 @@ jobs:
           fi
           echo "STEP: plan SUCCESS"
         env:
-          TF_VAR_aws_region: us-east-1
+          TF_VAR_aws_region:     us-east-1
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_SESSION_TOKEN:     ${{ secrets.AWS_SESSION_TOKEN }}
 
       - name: Comment plan on PR
         if: github.event_name == 'pull_request'
@@ -202,7 +206,10 @@ jobs:
             tfplan
           echo "STEP: apply SUCCESS"
         env:
-          TF_VAR_aws_region: us-east-1
+          TF_VAR_aws_region:     us-east-1
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_SESSION_TOKEN:     ${{ secrets.AWS_SESSION_TOKEN }}
 
       - name: Terraform Destroy
         id: destroy
@@ -213,7 +220,10 @@ jobs:
             -input=false \
             -auto-approve
         env:
-          TF_VAR_aws_region: us-east-1
+          TF_VAR_aws_region:     us-east-1
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_SESSION_TOKEN:     ${{ secrets.AWS_SESSION_TOKEN }}
 
       - name: Capture Terraform outputs
         id: tf_output
