@@ -38,23 +38,16 @@ permissions:
   pull-requests: write
 
 env:
-  TF_VERSION:   "1.7.5"
-  WORKING_DIR:  "./infra"
-  TF_BUCKET:    "udap-calculator-tf-state-a7f3k9"
-  TF_KEY:       "calculator/terraform.tfstate"
-  TF_REGION:    "us-east-1"
-  AWS_REGION:   "us-east-1"
+  TF_VERSION:  "1.7.5"
+  WORKING_DIR: "./infra"
+  TF_BUCKET:   "udap-calculator-tf-state-a7f3k9"
+  TF_KEY:      "calculator/terraform.tfstate"
+  TF_REGION:   "us-east-1"
 
 jobs:
   terraform:
     name: "Terraform apply"
     runs-on: ubuntu-latest
-
-    outputs:
-      ec2_public_ip:      ${{ steps.tf_output.outputs.ec2_public_ip }}
-      alb_dns_name:       ${{ steps.tf_output.outputs.alb_dns_name }}
-      ecr_repository_url: ${{ steps.tf_output.outputs.ecr_repository_url }}
-      aws_role_arn:       ${{ steps.tf_output.outputs.aws_role_arn }}
 
     env:
       AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -62,12 +55,20 @@ jobs:
       AWS_SESSION_TOKEN:     ${{ secrets.AWS_SESSION_TOKEN }}
       AWS_DEFAULT_REGION:    "us-east-1"
 
+    outputs:
+      ec2_public_ip:      ${{ steps.tf_output.outputs.ec2_public_ip }}
+      alb_dns_name:       ${{ steps.tf_output.outputs.alb_dns_name }}
+      ecr_repository_url: ${{ steps.tf_output.outputs.ecr_repository_url }}
+      aws_role_arn:       ${{ steps.tf_output.outputs.aws_role_arn }}
+
     steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
       - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.revision || github.sha }}
 
+      # ── 2. AWS credentials ───────────────────────────────────────────────────
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -76,182 +77,41 @@ jobs:
           aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region:            us-east-1
 
-      - name: Verify AWS identity and show VPC count
-        run: |
-          set -e
-          echo "## AWS Identity" >> "$GITHUB_STEP_SUMMARY"
-          aws sts get-caller-identity | tee -a "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "## VPC Count in us-east-1" >> "$GITHUB_STEP_SUMMARY"
-          VPC_COUNT=$(aws ec2 describe-vpcs --region us-east-1 \
-            --query 'length(Vpcs)' --output text)
-          echo "Current VPC count: $VPC_COUNT / 5" | tee -a "$GITHUB_STEP_SUMMARY"
-          aws ec2 describe-vpcs --region us-east-1 \
-            --query 'Vpcs[*].{ID:VpcId,CIDR:CidrBlock,Tags:Tags}' \
-            --output table | tee -a "$GITHUB_STEP_SUMMARY"
-
-      - name: Clean up orphaned VPCs from prior failed Terraform runs
-        run: |
-          set -e
-          echo "## VPC Cleanup" >> "$GITHUB_STEP_SUMMARY"
-          echo "Scanning for VPCs tagged Project=calculator, ManagedBy=terraform..." | tee -a "$GITHUB_STEP_SUMMARY"
-
-          # Find VPCs with our project tag that aren't in Terraform state
-          ORPHAN_VPCS=$(aws ec2 describe-vpcs --region us-east-1 \
-            --filters \
-              "Name=tag:Project,Values=calculator" \
-              "Name=tag:ManagedBy,Values=terraform" \
-            --query 'Vpcs[*].VpcId' \
-            --output text)
-
-          if [ -z "$ORPHAN_VPCS" ]; then
-            echo "No orphaned calculator VPCs found." | tee -a "$GITHUB_STEP_SUMMARY"
-          else
-            echo "Found orphaned VPCs: $ORPHAN_VPCS" | tee -a "$GITHUB_STEP_SUMMARY"
-            for VPC_ID in $ORPHAN_VPCS; do
-              echo "Cleaning up VPC $VPC_ID..." | tee -a "$GITHUB_STEP_SUMMARY"
-
-              # Delete all subnets
-              SUBNETS=$(aws ec2 describe-subnets --region us-east-1 \
-                --filters "Name=vpc-id,Values=$VPC_ID" \
-                --query 'Subnets[*].SubnetId' --output text || echo "")
-              for S in $SUBNETS; do
-                echo "  Deleting subnet $S" | tee -a "$GITHUB_STEP_SUMMARY"
-                aws ec2 delete-subnet --region us-east-1 --subnet-id "$S" || true
-              done
-
-              # Detach and delete internet gateways
-              IGWS=$(aws ec2 describe-internet-gateways --region us-east-1 \
-                --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
-                --query 'InternetGateways[*].InternetGatewayId' --output text || echo "")
-              for IGW in $IGWS; do
-                echo "  Detaching IGW $IGW" | tee -a "$GITHUB_STEP_SUMMARY"
-                aws ec2 detach-internet-gateway --region us-east-1 --internet-gateway-id "$IGW" --vpc-id "$VPC_ID" || true
-                echo "  Deleting IGW $IGW" | tee -a "$GITHUB_STEP_SUMMARY"
-                aws ec2 delete-internet-gateway --region us-east-1 --internet-gateway-id "$IGW" || true
-              done
-
-              # Delete route tables (non-main)
-              RTS=$(aws ec2 describe-route-tables --region us-east-1 \
-                --filters "Name=vpc-id,Values=$VPC_ID" \
-                --query 'RouteTables[?Associations[?Main==`false`] || length(Associations)==`0`].RouteTableId' \
-                --output text || echo "")
-              for RT in $RTS; do
-                echo "  Deleting route table $RT" | tee -a "$GITHUB_STEP_SUMMARY"
-                aws ec2 delete-route-table --region us-east-1 --route-table-id "$RT" || true
-              done
-
-              # Delete security groups (non-default)
-              SGS=$(aws ec2 describe-security-groups --region us-east-1 \
-                --filters "Name=vpc-id,Values=$VPC_ID" \
-                --query 'SecurityGroups[?GroupName!=`default`].GroupId' \
-                --output text || echo "")
-              for SG in $SGS; do
-                echo "  Deleting security group $SG" | tee -a "$GITHUB_STEP_SUMMARY"
-                aws ec2 delete-security-group --region us-east-1 --group-id "$SG" || true
-              done
-
-              # Delete the VPC itself
-              echo "  Deleting VPC $VPC_ID" | tee -a "$GITHUB_STEP_SUMMARY"
-              aws ec2 delete-vpc --region us-east-1 --vpc-id "$VPC_ID" | tee -a "$GITHUB_STEP_SUMMARY" || \
-                echo "  WARNING: could not delete VPC $VPC_ID" | tee -a "$GITHUB_STEP_SUMMARY"
-            done
-          fi
-
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          NEW_COUNT=$(aws ec2 describe-vpcs --region us-east-1 \
-            --query 'length(Vpcs)' --output text)
-          echo "VPC count after cleanup: $NEW_COUNT / 5" | tee -a "$GITHUB_STEP_SUMMARY"
-
-      - name: Ensure S3 state bucket exists
-        run: |
-          set -e
-          BUCKET="${{ env.TF_BUCKET }}"
-          REGION="${{ env.TF_REGION }}"
-          echo "## S3 Bucket: $BUCKET" >> "$GITHUB_STEP_SUMMARY"
-          if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
-            echo "Bucket $BUCKET already exists." | tee -a "$GITHUB_STEP_SUMMARY"
-          else
-            echo "Creating bucket $BUCKET..." | tee -a "$GITHUB_STEP_SUMMARY"
-            aws s3api create-bucket --bucket "$BUCKET" --region "$REGION" | tee -a "$GITHUB_STEP_SUMMARY"
-            aws s3api put-bucket-versioning --bucket "$BUCKET" \
-              --versioning-configuration Status=Enabled
-            aws s3api put-bucket-encryption --bucket "$BUCKET" \
-              --server-side-encryption-configuration \
-              '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
-            aws s3api put-public-access-block --bucket "$BUCKET" \
-              --public-access-block-configuration \
-              "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
-            echo "Bucket $BUCKET created." | tee -a "$GITHUB_STEP_SUMMARY"
-          fi
-
+      # ── 3. Setup Terraform ───────────────────────────────────────────────────
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
 
+      # ── 4. Terraform Init — capture to /tmp/tf_init.log ──────────────────────
       - name: Terraform Init
         id: init
         working-directory: ${{ env.WORKING_DIR }}
         run: |
-          set +e
-          echo "## Terraform Init" >> "$GITHUB_STEP_SUMMARY"
           terraform init \
             -input=false \
             -reconfigure \
             -backend-config="bucket=${{ env.TF_BUCKET }}" \
             -backend-config="key=${{ env.TF_KEY }}" \
             -backend-config="region=${{ env.TF_REGION }}" \
-            -backend-config="encrypt=true" > /tmp/tf_init.log 2>&1
-          INIT_RC=$?
-          cat /tmp/tf_init.log
-          cat /tmp/tf_init.log >> "$GITHUB_STEP_SUMMARY"
-          if [ "$INIT_RC" -ne 0 ]; then
-            echo "::error::TERRAFORM INIT FAILED (exit $INIT_RC) — full output above and in job summary"
-            echo "### INIT FAILED exit=$INIT_RC" >> "$GITHUB_STEP_SUMMARY"
-            exit "$INIT_RC"
-          fi
-          echo "### Init succeeded" >> "$GITHUB_STEP_SUMMARY"
+            -backend-config="encrypt=true" 2>&1 | tee /tmp/tf_init.log
+          echo "TF_INIT_EXIT=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
 
-      - name: Terraform Validate
-        id: validate
-        working-directory: ${{ env.WORKING_DIR }}
-        run: |
-          set +e
-          echo "## Terraform Validate" >> "$GITHUB_STEP_SUMMARY"
-          terraform validate -no-color > /tmp/tf_validate.log 2>&1
-          VALIDATE_RC=$?
-          cat /tmp/tf_validate.log
-          cat /tmp/tf_validate.log >> "$GITHUB_STEP_SUMMARY"
-          if [ "$VALIDATE_RC" -ne 0 ]; then
-            echo "::error::TERRAFORM VALIDATE FAILED"
-            exit "$VALIDATE_RC"
-          fi
-
+      # ── 5. Terraform Plan ────────────────────────────────────────────────────
       - name: Terraform Plan
         id: plan
         working-directory: ${{ env.WORKING_DIR }}
         run: |
-          set +e
-          echo "## Terraform Plan" >> "$GITHUB_STEP_SUMMARY"
           terraform plan \
             -no-color \
             -input=false \
-            -out=tfplan > /tmp/tf_plan.log 2>&1
-          PLAN_RC=$?
-          cat /tmp/tf_plan.log
-          tail -100 /tmp/tf_plan.log >> "$GITHUB_STEP_SUMMARY"
-          if [ "$PLAN_RC" -ne 0 ]; then
-            echo "::error::TERRAFORM PLAN FAILED (exit $PLAN_RC)"
-            echo "### PLAN FAILED exit=$PLAN_RC" >> "$GITHUB_STEP_SUMMARY"
-            cat /tmp/tf_plan.log >> "$GITHUB_STEP_SUMMARY"
-            exit "$PLAN_RC"
-          fi
-          echo "### Plan succeeded" >> "$GITHUB_STEP_SUMMARY"
+            -out=tfplan 2>&1 | tee /tmp/tf_plan.log
+          echo "TF_PLAN_EXIT=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
         env:
           TF_VAR_aws_region: us-east-1
 
+      # ── 6. Terraform Apply ───────────────────────────────────────────────────
       - name: Terraform Apply
         id: apply
         if: |
@@ -259,45 +119,21 @@ jobs:
           (github.event_name == 'workflow_dispatch' && inputs.action == 'apply')
         working-directory: ${{ env.WORKING_DIR }}
         run: |
-          set +e
-          echo "## Terraform Apply" >> "$GITHUB_STEP_SUMMARY"
           terraform apply \
             -no-color \
             -input=false \
             -auto-approve \
-            tfplan > /tmp/tf_apply.log 2>&1
-          APPLY_RC=$?
-          cat /tmp/tf_apply.log
-          tail -100 /tmp/tf_apply.log >> "$GITHUB_STEP_SUMMARY"
-          if [ "$APPLY_RC" -ne 0 ]; then
-            echo "::error::TERRAFORM APPLY FAILED (exit $APPLY_RC)"
-            echo "### APPLY FAILED exit=$APPLY_RC" >> "$GITHUB_STEP_SUMMARY"
-            cat /tmp/tf_apply.log >> "$GITHUB_STEP_SUMMARY"
-            exit "$APPLY_RC"
-          fi
-          echo "### Apply succeeded" >> "$GITHUB_STEP_SUMMARY"
+            tfplan 2>&1 | tee /tmp/tf_apply.log
+          echo "TF_APPLY_EXIT=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
         env:
           TF_VAR_aws_region: us-east-1
 
-      - name: Terraform Destroy
-        id: destroy
-        if: github.event_name == 'workflow_dispatch' && inputs.action == 'destroy'
-        working-directory: ${{ env.WORKING_DIR }}
-        run: |
-          set -e
-          terraform destroy \
-            -no-color \
-            -input=false \
-            -auto-approve
-        env:
-          TF_VAR_aws_region: us-east-1
-
+      # ── 7. Capture outputs ───────────────────────────────────────────────────
       - name: Capture Terraform outputs
         id: tf_output
         if: steps.apply.outcome == 'success'
         working-directory: ${{ env.WORKING_DIR }}
         run: |
-          set -e
           EC2_IP=$(terraform output -raw ec2_public_ip         2>/dev/null || echo "")
           ALB_DNS=$(terraform output -raw alb_dns_name         2>/dev/null || echo "")
           ECR_URL=$(terraform output -raw ecr_repository_url   2>/dev/null || echo "")
@@ -308,25 +144,22 @@ jobs:
           echo "ecr_repository_url=$ECR_URL" >> "$GITHUB_OUTPUT"
           echo "aws_role_arn=$ROLE_ARN"      >> "$GITHUB_OUTPUT"
 
-          printf "## Outputs\n| Output | Value |\n|--------|-------|\n| ec2_public_ip | \`%s\` |\n| alb_dns_name | \`%s\` |\n| ecr_repository_url | \`%s\` |\n| aws_role_arn | \`%s\` |\n" \
-            "$EC2_IP" "$ALB_DNS" "$ECR_URL" "$ROLE_ARN" >> "$GITHUB_STEP_SUMMARY"
-
           echo "Live URL: http://$EC2_IP"
 
+      # ── 8. Retrieve private key ──────────────────────────────────────────────
       - name: Retrieve private key
         id: privkey
         if: steps.apply.outcome == 'success'
         working-directory: ${{ env.WORKING_DIR }}
         run: |
-          set -e
           PRIVKEY=$(terraform output -raw ec2_private_key_pem 2>/dev/null || echo "")
           echo "::add-mask::$PRIVKEY"
           printf 'pem<<KEYEOF\n%s\nKEYEOF\n' "$PRIVKEY" >> "$GITHUB_OUTPUT"
 
+      # ── 9. Set repo variables ────────────────────────────────────────────────
       - name: Set repository variables and EC2_SSH_KEY secret
         if: steps.apply.outcome == 'success'
         run: |
-          set -e
           API="https://api.github.com"
           GH_TOKEN="${{ secrets.GITHUB_TOKEN }}"
           REPO="${{ github.repository }}"
@@ -366,6 +199,25 @@ jobs:
           set_var "TF_OUT_ALB_DNS_NAME"         "$ALB_DNS"
           set_var "AWS_REGION"                  "us-east-1"
           echo "All variables and EC2_SSH_KEY set."
+
+      # ── ALWAYS: dump all captured logs to summary ────────────────────────────
+      - name: Dump logs to job summary (always)
+        if: always()
+        run: |
+          echo "## Terraform Log Dump" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Init log (exit=${TF_INIT_EXIT:-not_run})" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat /tmp/tf_init.log  >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "(no init log)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "### Plan log (exit=${TF_PLAN_EXIT:-not_run})" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat /tmp/tf_plan.log  >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "(no plan log)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "### Apply log (exit=${TF_APPLY_EXIT:-not_run})" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat /tmp/tf_apply.log >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "(no apply log)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "FULL_LOG_DUMP_COMPLETE"
 
   notify-failure:
     name: "Notify on failure"
